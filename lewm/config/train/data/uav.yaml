@@ -1,0 +1,3 @@
+dir: ${oc.env:WM_ROOT}/data/wm_v1   # collect.py episodes (ep_*.npz)
+num_steps: ${eval:'${num_preds} + ${history_size}'}
+frameskip: 5                        # 20 Hz env -> one frame / action block every 0.25 s
