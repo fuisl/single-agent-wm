@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venvs/
+
+# Third-party clones (scripts/setup_envs.sh), data and runs
+third_party/
+data/
+runs/
+logs/
+*.zip
+smoke.png
+outputs/
+logs_*.txt

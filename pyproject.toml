@@ -1,0 +1,20 @@
+[project]
+name = "single-agent-wm"
+version = "0.1.0"
+description = "World-model memory probing for single-UAV depth navigation (Isaac Sim + OmniDrones)"
+readme = "README.md"
+authors = [
+    { name = "fuisl", email = "135719107+fuisl@users.noreply.github.com" }
+]
+requires-python = ">=3.11,<3.12"
+# Main env (.venv): probe + analysis. Isaac Sim and DreamerV3 live in .venvs/{isaac,dreamer}; see scripts/setup_envs.sh
+dependencies = [
+    "torch>=2.5",
+    "numpy<2",
+    "scipy",
+    "matplotlib",
+    "opencv-python-headless",
+]
+
+[tool.uv]
+package = false
