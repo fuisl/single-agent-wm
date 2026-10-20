@@ -11,11 +11,11 @@ wheels/
 .venvs/
 
 # Third-party clones (scripts/setup_envs.sh), data and runs
-third_party/
-data/
-runs/
-logs/
+/third_party/
+/data/
+/runs/
+/logs/
 *.zip
 smoke.png
-outputs/
+/outputs/
 logs_*.txt
