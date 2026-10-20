@@ -9,6 +9,7 @@ single UAV navigate (escape U/C traps) with only a forward depth camera? Setup f
 | dir | what | env |
 |---|---|---|
 | `uav_env/` | Isaac server for RL (`rl_server.py`), data collection with a scripted pilot (`collect.py`), scenes / A* / labels (`scenegen.py`), viz | `.venvs/isaac` |
+| `uav_env/kin*.py` | kinematic stand-in without Isaac: analytic depth + first-order dynamics, same protocol / data format (`kin_server.py`, `kin_collect.py`) | `.venv` |
 | `dreamer/` | DreamerV3: offline WM training + feature export (`train_wm.py`), online RL (`train_rl.py`, `run_rl.sh`), eval (`eval_rl.py`) | `.venvs/dreamer` |
 | `probe/` | memory probe: latent -> ego occupancy map, AP on visible / memory / never-seen cells | `.venv` |
 | `scripts/` | env setup (`setup_envs.sh`), one-time root setup (`sudo_setup.sh`), pipelines | |
@@ -21,6 +22,14 @@ sudo bash scripts/sudo_setup.sh     # once: ffmpeg/GLU, extra swap, no suspend, 
 bash scripts/setup_envs.sh          # uv envs: .venv (main), .venvs/isaac (py3.10), .venvs/dreamer (py3.11)
 source env.sh                       # PYTHONPATH, DV3_ROOT, $PY_MAIN / $PY_ISAAC / $PY_DREAMER
 ```
+
+## Isaac Sim on this laptop
+
+Isaac Sim 4.1's RTX renderer segfaults on NVIDIA driver 595 (crash in `__enable_hydra_engine` whenever
+rendering starts). Fix: `sudo bash scripts/sudo_driver.sh 580` and reboot. Until then, the kinematic stand-in
+(`uav_env/kinsim.py`) produces data and serves RL / evaluation with the same interface:
+`kin_collect.py` instead of `collect.py`, `SERVER=kin_server.py bash dreamer/run_rl.sh ...` for online RL.
+Its depth is exact for this box world; its dynamics are simplified (yaw-only attitude, first-order velocity).
 
 ## Pipeline
 

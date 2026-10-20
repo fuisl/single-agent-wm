@@ -4,9 +4,9 @@
 set -e
 USER_NAME=${SUDO_USER:-fuisloy}
 
-# 1. ffmpeg (episode / demo videos) and GLU + vulkan-tools (Isaac Sim rendering, `vulkaninfo` for debugging)
+# 1. ffmpeg (episode / demo videos), GLU + OpenGL (Isaac Sim fails to start without them), vulkan-tools (Isaac Sim rendering, `vulkaninfo` for debugging)
 apt-get update
-apt-get install -y ffmpeg libglu1-mesa vulkan-tools
+apt-get install -y ffmpeg libglu1-mesa libopengl0 vulkan-tools
 
 # 2. +16 GB swap: Isaac Sim alone takes ~8 GB RAM and this machine has 14 GB
 if [ ! -f /swapfile_wm ]; then
