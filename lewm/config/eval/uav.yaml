@@ -1,0 +1,22 @@
+defaults:
+  - solver: cem
+  - _self_
+
+run_dir: ${oc.env:WM_ROOT}/runs/lewm
+seed: 42
+
+# rl_server.py (started with --extras) and test suites, as in dreamer/eval_rl.py
+port: 6140
+envs: 16
+episodes: 100           # per suite
+suites: random,utrap,utrap_in,ctrap
+seed_base: 100000
+
+plan_config:
+  horizon: 5            # planned action blocks (5 x 0.25 s)
+  receding_horizon: 1   # blocks executed before replanning
+  action_block: 5       # = training frameskip
+
+hydra:
+  run:
+    dir: ${run_dir}/hydra_eval
