@@ -20,6 +20,7 @@ parser.add_argument("--episodes", type=int, default=2000)
 parser.add_argument("--out", default="data/kin_v1")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_steps", type=int, default=1200)          # 60 s at 20 Hz
+parser.add_argument("--glance_rate", type=float, default=0.0, help="scenegen.Behaviour look-away glances (kin_v2)")
 args = parser.parse_args()
 
 
@@ -27,7 +28,7 @@ def episode(idx):
     rng = np.random.default_rng([args.seed, idx])
     mode = rng.choice(["goal", "explore", "trap"], p=[0.7, 0.15, 0.15])
     scene = sg.sample_scene(rng, need_trap=(mode == "trap"))
-    pilot = sg.Behaviour(scene, mode, rng)
+    pilot = sg.Behaviour(scene, mode, rng, glance_rate=args.glance_rate)
     drone = KinDrone(scene.start, np.arctan2(*(scene.goal - scene.start)[::-1]) + rng.uniform(-0.6, 0.6))
     seen = sg.SeenMap()
     d_prev = float(np.linalg.norm(scene.goal - scene.start))

@@ -1,0 +1,45 @@
+# M0 (spatial: false) / M1 (spatial: true): pixels-only tokens, body state as a separate predicted target
+_target_: jepa.TokenJEPA
+spatial: false
+
+encoder:
+  _target_: module.vit_depth
+  size: tiny
+  patch_size: 8          # 48x80 depth -> 6x10 patches (pooled to 3x5 when spatial)
+  image_size: [48, 80]
+
+predictor:
+  _target_: module.TokenPredictor
+  num_frames: ${history_size}
+  num_tokens: ${eval:'16 if ${model.spatial} else 1'}
+  state_dim: ???
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+projector:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

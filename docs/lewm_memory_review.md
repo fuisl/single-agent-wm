@@ -1,221 +1,380 @@
-# LeWM and obstacle memory: literature review and failure analysis (run `kin_v1`)
+# Memory for LeWM: diagnosis, literature review and extension plan
 
 Date: 2026-10-21. Data: `data/kin_v1` (1000 kinematic stand-in episodes, scripted goal / trap / explore policy).
-Runs: `runs/kin_v1/{lewm,wm,probe,probe_untrained}`. Diagnostics scripts: `scripts/diag/`.
+Runs: `runs/kin_v1/{lewm,wm,probe,probe_untrained,rl}`. Diagnostics: `scripts/diag/`, results in
+`runs/kin_v1/lewm/diag.json`.
+
+**Scope.** This document is about the reconstruction-free, latent-predictive path (LeWM / JEPA). The DreamerV3
+(RSSM, reconstruction) memory line, with its probe, map auxiliary loss and online RL, is colleagues' work. Here it
+appears only as a reference column measured on the same data.
 
 ## 0. Summary
 
-- **LeWM is not "broken" in the sense of a coding bug.** The training loop, loss, predictor, projector and
-  SIGReg match the official `lucas-maes/le-wm` code. The one structural deviation is ours by design: the 15-D body
-  state is *summed into the CLS token* before the projector (official LeWM is pixels-only).
-- **The memory question cannot be answered with LeWM as specified, by construction and by objective.**
-  The latent is a per-frame embedding, the predictor sees 3 frames (0.75 s), and the training signal for memory is
-  almost absent in our data: for the next predicted frame, only **1.0 %** of the visible obstacle content was last
-  seen more than 0.75 s earlier (91 % is in the 3 context frames, 6.7 % is new). With 1-step teacher-forced
-  prediction the gradient towards remembering is ~0 (Gregor et al. 2019's argument, measured here).
-- **The perception failure is real and is ours to fix**: {{PERCEPTION_VERDICT}}
-- **The control failure is mostly the planner objective**, not memory: a 1.25 s CEM horizon with no value function,
-  collision costing −5 against +10/m of progress, and reward heads read from embeddings that do not generalise.
-- **V-JEPA 2-AC does not fit** (≈3–4 orders of magnitude over the CEM compute budget on a 6 GB laptop GPU, ViT-g
-  + 300M predictor, RGB / Franka-specific, no memory beyond a 2–4 s window). At most a frozen feature extractor for
-  a perception probe, where a depth-native ViT-S is better evidenced.
-- **Minimal change to test the hypothesis**: (A) pixels-only encoder with state moved into the predictor's
-  conditioning, then (B) a recurrent belief over the embeddings trained on long sequences with multi-step targets on
-  data that actually revisits obstacles. See §6.
+1. **Diagnosis.** LeWM's code matches the official repository. On this task it fails at three points:
+   - **The global read-out.** The ViT's patch tokens hold the geometry: held-out depth to 2.7 cm. The single CLS
+     vector keeps only coarse geometry (0.32 m).
+   - **Our state fusion.** Summing the body state into the embedding makes every read-out memorise training
+     layouts: 0.09 m train vs 0.62 m held-out.
+   - **The architecture and objective.** Memory is impossible by construction: a per-frame latent and a 0.75 s
+     context. It is also unrewarded by the objective: only 1 % of next-frame obstacle content needs memory beyond
+     the window.
+2. **The literature says memory in a predictive latent is possible but must be built and demanded.** Every
+   reconstruction-free model with measured memory has the same three parts:
+   - a closed-loop recurrent belief over single-frame embeddings;
+   - multi-step open-loop prediction of future frame embeddings from that belief;
+   - data in which looked-away content returns.
 
-## 1. What we measured (recap)
+   The models are CPC|Action, PBL, BYOL-Explore, NE-Dreamer, and VAE+GRU in Memory Maze. 1-step prediction gives
+   ~0 gradient to the belief (Gregor et al. 2019), and the V-JEPA 2 predictor drops hidden objects within 0.3 s
+   unless trained on occlusion data (Xie & Alanwar 2026).
+3. **The gap.** No 2025–26 JEPA world model tests memory of out-of-view content under egocentric partial
+   observability:
+   - The JEPA navigation models (InJePA, Skytopia, NWM) use short frame windows and report task success only.
+   - The closest prior work evaluates only on the fully observable LeWM benchmarks. That is a JEPA world model
+     with an associative memory bank (Sun & Zhu 2026, arXiv:2610.19683).
+   - Nobody regularises a recurrent JEPA belief with SIGReg.
+4. **Plan.** R-LeWM is a short ladder of minimal changes:
+   - pixels-only encoder (state into the predictor's conditioning);
+   - a few spatial tokens;
+   - a GRU belief with a multi-step open-loop head and truncated BPTT;
+   - training data with memory pressure.
 
-| | DreamerV3 RSSM | LeWM ctx (3 frames) | LeWM emb | LeWM random init | frame CNN |
+   Evaluation is label-free first: re-entry prediction error, surprise on layout edits, lesions and transplants of
+   the belief, and closed-loop trap escape. Occupancy probes come last. The component, bandwidth and frame
+   analyses are chosen so that their answers carry over to multi-agent world-model design.
+5. **V-JEPA 2-AC does not fit.** It is 3–4 orders of magnitude over the fleet CEM budget, has no persistent
+   memory, and is RGB- and Franka-specific. At most it could serve as a frozen perception baseline.
+
+## 1. Measurements on `kin_v1`
+
+| | LeWM ctx (3 frames) | LeWM emb | LeWM random init | frame CNN | *reference: DreamerV3 RSSM* |
 |---|---|---|---|---|---|
-| probe AP, visible cells | **0.342** | 0.062 | 0.069 | 0.161 | 0.33 |
-| probe AP, remembered (all ages) | **0.105** | 0.059 | 0.058 | 0.075 | 0.062 |
-| probe AP, remembered, age 1–10 steps | **0.281** | 0.057 | 0.056 | 0.165 | 0.15 |
-| depth decoder MAE train / held-out (m) | 0.045 / 0.058 | 0.16 / 0.53 | | | |
+| probe AP, visible cells (base 0.009) | 0.062 | 0.069 | 0.161 | 0.33 | *0.342* |
+| probe AP, remembered cells (base 0.020) | 0.059 | 0.058 | 0.075 | 0.062 | *0.105* |
+| probe AP, remembered, ≤ 0.5 s | 0.057 | 0.056 | 0.165 | 0.15 | *0.281* |
+| depth decoder, train / held-out MAE (m) | | 0.09 / 0.62 | 0.11 / 0.18 | | *0.045 / 0.058* |
 
-Base rates: visible 0.009, remembered 0.020. Dreamer's memory decays to frame level by ~40–80 steps (2–4 s).
-LeWM CEM control (100 episodes per suite): goal 5 % / collision 82 % (random), 5 % / 86 % (U-trap), 0 % / 100 %
-(start inside U or C trap; it flies ~1.2 m forward into the wall in ~1.3 s).
+Closed loop, 100 episodes per suite, goal / collision:
 
-## 2. Literature
+| suite | LeWM + CEM | *reference: DreamerV3 online RL (5e5 steps)* |
+|---|---|---|
+| random | 5 % / 82 % | *98 % / 2 %* |
+| U-trap (approach) | 5 % / 86 % | *98 % / 2 %* |
+| start inside U-trap | 0 % / 100 % | *65 % / 11 %* |
+| C-trap | 0 % / 100 % | *16 % / 44 %* |
 
-### 2.1 LeWM as published: what it was built and validated for
+The CEM comparison is not like-for-like: a 1.25 s planning horizon with no value function, against a learned
+actor-critic. The trap rows are the target for a memory-equipped LeWM.
 
-Maes, Le Lidec, Scieur, LeCun, Balestriero (2026), *LeWorldModel: Stable End-to-End JEPA from Pixels*,
-arXiv:2603.19312; code github.com/lucas-maes/le-wm (checked at commit 8edfeb3).
+## 2. Diagnosis of LeWM on this task
 
-- Encoder ViT-tiny (patch 14, 224² RGB); the embedding is the **[CLS] token only** + BatchNorm MLP projector
-  (192-d). Patch tokens are never used.
-- **Pixels-only**: proprioception is loaded by the data configs but never read by `JEPA.encode`; the paper calls
-  the model pixels-only and removes proprio from the DINO-WM baseline "for a fair comparison".
-- Loss: teacher-forced 1-step next-embedding MSE (history 3, frameskip 5) + 0.09·SIGReg.
-- Planning: CEM on the latent distance to a **goal image**; no reward head; horizon 5 blocks.
-- Environments: TwoRoom, PushT, OGBench-Cube, DMC Reacher, all fully observable from one frame (top-down or a
-  fixed camera); evaluation start/goal pairs are drawn from the training set, and the train/val split is over
-  windows, not layouts. **Nothing in the official protocol tests held-out layouts, partial observability or memory.**
-- Probes in the paper are linear/MLP readouts of agent/object pose (r ≈ 0.97–0.99), with weak rotation and
-  velocity (Cube joint velocity r = 0.095). No geometry/occupancy probe, no random-encoder baseline.
-- Stated limitations: short-horizon planning; low data diversity "weakens SIGReg in simple, low-dimensional
-  environments"; embedding dimension below ~184 hurts (we use 192).
-- Zhang et al. (2026), *Frozen in a Frame*, arXiv:2610.04585: on the released LeWM weights, linear velocity probes
-  are at or below chance while position probes reach R² ≈ 0.95: single-frame JEPA embeddings carry no motion.
+### 2.1 Code audit against the official repository (lucas-maes/le-wm @ 8edfeb3)
 
-### 2.2 What a JEPA / SIGReg latent keeps
+**Matches the official code:**
+- the loss (`lejepa_forward`, teacher-forced over all causal positions);
+- SIGReg (17 knots, 1024 projections, λ = 0.09);
+- ARPredictor (6 blocks, 16 heads, AdaLN-zero, dropout 0.1);
+- the BatchNorm MLP projector;
+- the action Embedder over frameskip-concatenated actions;
+- the optimiser (AdamW 5e-5, bf16, clip 1.0), batch 128, history 3, frameskip 5.
 
-- **SIGReg** (Balestriero & LeCun 2025, *LeJEPA*, arXiv:2511.08544) forces the batch marginal of the embedding to
-  N(0, I). Its optimality results compare embeddings with the same information content; *which* input
-  information is kept is decided entirely by the prediction task.
-- **Slow / predictable features win.** Sobal et al. 2022 (arXiv:2211.10831): JEPAs "fail when the noise is fixed",
-  as the loss "can be easily minimized by paying attention to noise that does not change with time". Littwin et
-  al. 2024 (NeurIPS, arXiv:2407.03475): JEPAs are biased towards high-influence (highly predictive) features,
-  increasingly with depth. Tang et al. 2023 (ICML, arXiv:2212.03319): self-predictive learning converges to the top
-  eigenvectors of the transition operator, i.e. the most persistent modes.
-- **LeWM-specific evidence (2026).** Liu et al., *Temporally Centered SIGReg*, arXiv:2607.26924: the raw LeWM
-  objective "biases variance allocation toward the temporally persistent component", reducing decodability of
-  robot dynamics; applying SIGReg to temporally centred residuals raises LIBERO success 63.6 → 83.8 %.
-  Tan et al., *PokeWorld*, arXiv:2607.27017: a quantity becomes decodable when it is a prediction **target**;
-  providing it only as **input** does not make it decodable, and in their RH20T table the trained input-only model
-  reads it out worse than an untrained network (R² −0.16 vs 0.91), the same pattern as our trained-below-random
-  probe. Zhu et al. 2026 (arXiv:2609.04264) name this "physical representation laziness": LeWM latents "do not
-  collapse but nonetheless fail to represent key physical properties".
-- **Global vs patch latents.** DINO-WM (Zhou, Pan, LeCun, Pinto, ICML 2025, arXiv:2411.04983), Table 2: DINOv2
-  CLS vs patch features, success on Wall 0.58 vs 0.96, Reach 0.60 vs 0.92, PushT 0.44 vs 0.90; on unseen layouts
-  (WallRandom) CLS 0.64 vs patch 0.82, DreamerV3 0.76. A single global vector loses "crucial spatial details".
-- **Theory for histories.** Ni et al. 2024 (ICLR, arXiv:2401.08898): self-prediction (ZP) is weaker than
-  observation prediction (belief), and needs reward prediction to pin task content; for POMDPs "start with
-  recurrent networks as the encoder". LeWM's per-frame encoder does not satisfy their recurrence condition.
-
-### 2.3 Memory in world models
-
-- **Probing protocol.** Pasukonis, Lillicrap, Hafner 2022, *Memory Maze* (arXiv:2210.13383): frozen-state MLP
-  probes (linear was too weak) for wall layout and object positions. RSSM with truncated BPTT (state carried
-  across batches) beats plain RSSM, which "effectively resets the state to zero every 48 steps"; on large mazes
-  models barely beat a no-memory baseline. Adding the probe target as an auxiliary loss helps the agent.
-- **Sequence length bounds memory.** Samsami et al. 2024, *R2I* (ICLR, arXiv:2403.04253): DreamerV3 handles
-  memory delays up to ~30 steps; models trained on 64-step sequences fail completely once the needed memory
-  exceeds 64 steps; performance rises monotonically with training sequence length 64 → 1024. **This is very
-  likely why our Dreamer probe decays by 40–80 steps (DreamerV3 batch length 64).**
-- **Next-step prediction gives no pressure to remember.** Gregor et al. 2019, *Shaping belief states with
-  generative environment models* (NeurIPS, arXiv:1906.09237): the immediate future is nearly a function of the last
-  few observations, so ∇_b L ≈ 0 for the belief; longer overshoot (multi-step prediction, 4–32 steps) improves
-  map decoding, and **deterministic predictors gain the least**. A deterministic L2 JEPA predictor is the worst case.
-- **Data must contain revisits.** TECO (Yan et al., ICML 2023, arXiv:2210.02396) and long-context video WMs
-  (S4WM, Deng et al. NeurIPS 2023, arXiv:2307.02064; Po et al. 2025, arXiv:2505.20171; WorldMem, arXiv:2504.12369)
-  all build datasets where the camera returns to earlier content, because "many existing video benchmarks do not
-  have strong long-range dependencies, where a model with limited context is sufficient".
-- **Backbone choice matters less than training length.** S4WM's Memory Maze probes: RSSM-TBTT 95.0 % walls (9×9)
-  vs TSSM-XL 86.4 vs S4WM 88.4. POPGym (Morad et al., ICLR 2023): "the GRU is the best general-purpose memory model".
-- **JEPA predictors and object permanence.** V-JEPA shows object-permanence surprise (Garrido et al. 2025,
-  arXiv:2502.11831) but the authors note "current JEPA models have limited memory" (3–4 s clips). Xie & Alanwar
-  2026 (arXiv:2610.07355, preprint): the frozen V-JEPA 2 predictor loses a hidden moving object within 0.3 s even
-  though the encoder still has it; 3k predictor-only steps on occlusion data install permanence: "the deficit is
-  not intrinsic to latent prediction; what persists changes with the masks and the data."
-- **Depth-sighted agents build no maps by themselves.** Wijmans et al. 2023 (ICLR, arXiv:2301.13261): blind LSTM
-  agents' memories contain decodable occupancy (IoU 32.5 % vs 12.5 % untrained), but for depth-sighted agents
-  "we do not find conclusive evidence that metric maps can be decoded": rich sensing admits reactive solutions.
-  MAD (arXiv:2606.04534) reconstructs occupancy + visibility grids in a Dreamer RSSM for exactly this reason.
-
-### 2.4 Trap escape: memory vs horizon / value
-
-- AirDreamer (Liu et al. 2026, arXiv:2606.03252) attributes trap escape to the value function estimating "future
-  returns beyond the rollout" and to emergent yaw scanning; it does not ablate memory.
-- Meijer et al. 2024 (arXiv:2407.13530): an LSTM helps a learned reactive planner only where the current view is
-  ambiguous; large or deep minima still fail.
-- TD-MPC (Hansen et al., ICML 2022): finite-horizon MPC "yields only temporally local optimal solutions"; a
-  terminal value fixes it. You et al. 2026 (arXiv:2607.10362): single-step latent error is "essentially
-  uncorrelated with control success", since planners query off-manifold latents.
-
-## 3. Verification: our implementation, or the nature of the task?
-
-### 3.1 Code audit against the official repository
-
-Matches: loss (`lejepa_forward`, teacher-forced over all causal positions), SIGReg (17 knots, 1024 projections,
-λ = 0.09), ARPredictor (6 blocks, 16 heads, AdaLN-zero, dropout 0.1), BatchNorm MLP projector / pred_proj,
-action Embedder over frameskip-concatenated actions, AdamW 5e-5, bf16, clip 1.0, batch 128, history 3, frameskip 5.
-
-Differences (all deliberate, ordered by how much they could matter):
+The official `JEPA.encode` reads only pixels and actions. Proprioception is loaded by the data configs but never
+used.
 
 | ours | official | consequence |
 |---|---|---|
-| `emb = proj(CLS + Embedder(state))` | `emb = proj(CLS)` | state is part of the target and of the SIGReg budget: an easy, persistent, action-predictable component (§2.2) |
-| state added after the ViT's final LayerNorm, unscaled | — | relative weight of state vs pixels unconstrained |
-| 1-ch 48×80 depth, patch 8, 60 tokens | 224² RGB, patch 14, 256 tokens | CLS must summarise spatial occupancy of a cluttered egocentric view |
-| reward / terminal heads, return-maximising CEM | goal-image latent distance | collision avoidance only through a post-hoc head |
-| held-out layouts (episode-hash split) | in-distribution windows | generalisation never tested by the original paper |
-| 30k steps ≈ 0.4M windows seen | 10 epochs ≈ 2–4M windows (paper) | possibly under-trained (secondary) |
+| `emb = proj(CLS + Embedder(state))` | `emb = proj(CLS)` | state becomes part of the target and of the SIGReg budget (§2.3–2.4) |
+| 1-ch 48×80 depth, patch 8, 60 tokens | 224² RGB, patch 14, 256 tokens | one CLS vector must summarise an egocentric cluttered view |
+| reward / terminal heads, return-maximising CEM | latent distance to a goal image | collision avoidance only through a post-hoc head |
+| held-out layouts (episode-hash split) | train/val split over windows; goals drawn from the training set | generalisation never tested by the original paper |
+| 30k steps ≈ 0.4M windows | 10 epochs ≈ 2–4M windows | possibly under-trained (secondary) |
 
-### 3.2 Experiment 1: how much memory does the objective ask for? (data only)
+### 2.2 How much memory does the objective ask for? (`scripts/diag/reobs.py`, data only)
 
-`scripts/diag/reobs.py`: for obstacle cells visible at t+k, where was that information available to LeWM's
-predictor at time t (frames t−10, t−5, t)?
+Take the obstacle cells visible at t+k. Was their information available to LeWM's predictor at time t, which
+sees frames t−10, t−5 and t?
 
-| target | in the 3 context frames | never seen (novel) | seen 1–15 steps ago, not in a context frame | 16–64 steps ago | > 64 steps ago |
+| target | in the 3 context frames | never seen | last seen 1–15 steps ago | 16–64 | > 64 |
 |---|---|---|---|---|---|
 | next frame, k = +5 (all episodes) | 0.909 | 0.067 | 0.014 | 0.005 | 0.005 |
 | next frame, k = +5 (trap episodes) | 0.921 | 0.056 | 0.013 | 0.004 | 0.005 |
 | CEM horizon end, k = +25 (all) | 0.668 | 0.287 | 0.016 | 0.011 | 0.017 |
 | CEM horizon end, k = +25 (trap) | 0.717 | 0.241 | 0.015 | 0.009 | 0.017 |
 
-Memory beyond the LeWM window could explain at most ~1 % of the next-frame obstacle content (2.6–2.8 % at the
-1.25 s horizon). Even a perfect memory would barely lower LeWM's training loss, so **this data + objective cannot
-elicit memory, in LeWM or any 1-step predictor**: a property of the task setup, not of our code. The same holds
-for Dreamer's 1-step objective, which is consistent with its memory being short (it is carried passively by the
-GRU, then fades).
+Even a perfect memory would lower LeWM's training loss on at most ~1 % of next-frame obstacle content, and
+~2.8 % at a 1.25 s horizon. **This data and this objective cannot produce memory.** This is a property of the
+setup, not a code bug, and it sets two of the design constraints in §5: multi-step targets and revisit-rich data.
 
-### 3.3 Experiment 2: where is the obstacle geometry lost?
+### 2.3 Where is the obstacle geometry lost? (`scripts/diag/lewm_diag.py`, part A)
 
-{{DIAG_DECODE}}
+Setup:
+- The same depth decoder for each read-out (a matching conv decoder for the 6×10 patch grid).
+- 3000 steps on 120 train episodes; scored on 60 episodes with held-out layouts.
+- Baseline: a constant mean image scores 1.03 m.
+- "near" = pixels closer than 2.5 m.
 
-### 3.4 Experiment 3: what does the trained predictor use?
+| read-out (192-d unless noted) | train MAE (m) | held-out MAE (m) | held-out near (m) |
+|---|---|---|---|
+| trained: 60 patch tokens (60×192) | 0.025 | **0.027** | 0.046 |
+| random init: 60 patch tokens | 0.017 | 0.018 | 0.023 |
+| trained: CLS, before the state is added | 0.263 | **0.315** | 0.744 |
+| random init: final emb | 0.105 | 0.178 | 0.339 |
+| trained: final emb = proj(CLS + state) | 0.091 | **0.617** | 1.641 |
+| trained: state embedding alone | 0.363 | 0.776 | 2.827 |
 
-{{DIAG_PREDICT}}
+- **The encoder is fine.** Its patch tokens reconstruct held-out depth to 2.7 cm, with no generalisation gap.
+- **The CLS read-out keeps only coarse geometry.** Training makes the global vector *worse* than random weights,
+  in both the decoder (0.62 vs 0.18 m) and the probe (AP 0.06 vs 0.16). The objective discards pixel detail from
+  the global embedding.
+- **The state is the layout-memorisation shortcut.** The state embedding alone decodes *training* depth well
+  (0.36 m) because it identifies the scripted start/goal configuration, but it generalises worst.
+- The decoder, the probe and the reward head all read the final embedding, so all three inherit this shortcut.
 
-### 3.5 Verdict
+### 2.4 What does the trained predictor use? (part B, 4361 held-out windows)
 
-{{VERDICT}}
+Each row replaces one part of the context with its dataset mean; the target is unchanged.
 
-## 4. Where exactly LeWM fails, layer by layer
+| context | next-embedding MSE |
+|---|---|
+| full context | 0.008 |
+| copy last frame | 0.148 |
+| actions shuffled | 0.450 |
+| state part → mean (pixels kept) | 0.584 |
+| pixel part → mean (state kept) | 0.599 |
+| target variance | 1.019 |
+| *target moves, if its pixel part → mean* | 0.594 |
+| *target moves, if its state part → mean* | 0.830 |
 
-{{LAYERS}}
+- Prediction is near-perfect in distribution and uses pixels, state and actions, so it is not a pure shortcut.
+- The target, however, is state-dominated: under SIGReg most of the 192 unit-variance directions go to the body
+  state and to slow, coarse view features.
 
-## 5. Would V-JEPA 2-AC help?
+### 2.5 Verdict
 
-Facts (Assran et al. 2025, arXiv:2506.09985; repo facebookresearch/vjepa2; V-JEPA 2.1, arXiv:2603.14482):
+| failure | cause | whose |
+|---|---|---|
+| probe below random init; decoder 7× held-out gap | state fused into the target embedding | **ours**: deviation from pixels-only LeWM |
+| global latent keeps only coarse geometry | one CLS vector, plus the JEPA bias toward persistent, predictable features | **LeWM design** vs an egocentric cluttered view |
+| no out-of-view memory | per-frame latent, 0.75 s context, ~1 % memory demand in a 1-step target | **design + task**: untestable in LeWM as specified |
+| CEM collides 82–100 % | 1.25 s horizon, no value, cheap collision term, non-generalising reward head | **our planner adaptation** |
 
-- V-JEPA 2 encoders: ViT-L 300M, ViT-H 600M, ViT-g 1B (256 px, 2×16×16 tubelets); **no small V-JEPA 2**.
-  V-JEPA 2.1 (Mar 2026) adds distilled ViT-B 80M / ViT-L 300M at 384 px with dense features.
-- V-JEPA 2-AC: frozen ViT-g encoder, ~300M block-causal predictor, 256² RGB at 4 fps, 7-D end-effector actions
-  and state, < 62 h of DROID, trained on 32 GPUs. CEM 800 samples × 10 iterations × **horizon 1** against a goal
-  image: **16 s per action on an RTX 4090**. Checkpoint 11.8 GB (CPU RAM is 14 GB). JEPA-WMs (Terver et al., TMLR
-  2026, arXiv:2512.24497) report a bug in the released rollout loss.
-- Memory: none beyond attention over its 8–16-frame context, and the released planner uses a **single context
-  frame**. Its latent is spatial (patch tokens), but Xie & Alanwar 2026 show its predictor drops hidden objects
-  within ~0.3 s.
+## 3. Literature review
 
-Estimates for this laptop (≈10 TFLOP/s effective fp16, unmeasured): one 800×10×1 plan ≈ 1.3 PFLOP ≈ 2 min per
-action for one drone; 16 drones at 4 Hz need ~8000× the budget. The budget per plan (≈150 GFLOP) is about one
-forward of the AC predictor; even DINO-WM-sized patch predictors (19M params, 196 tokens) do not fit. A global or
-few-token latent like LeWM's is the regime that fits the fleet CEM.
+### 3.1 LeWM, and what a JEPA / SIGReg latent keeps
 
-Verdict: **no as a world model.** It would not test the memory hypothesis either (no persistent state, 1-frame
-planning context), it needs retraining for 5-D velocity actions and depth input that this GPU cannot do, and there
-is no evidence of V-JEPA transfer to depth or drones. The only sensible use is offline: a frozen V-JEPA 2.1 ViT-B
-(or better evidenced on depth, DeFM-S, arXiv:2601.18923, or DINOv2-S) as a *perception* baseline for the visible-
-cell probe. That answers "is a pretrained dense encoder better at seeing obstacles", which is not our question.
+- **LeWM** (Maes, Le Lidec, Scieur, LeCun, Balestriero 2026, arXiv:2603.19312).
+  - Design: CLS-only, pixels-only, 1-step teacher-forced prediction plus SIGReg, CEM to a goal image.
+  - Evaluation: fully observable tasks only (TwoRoom, PushT, OGBench-Cube, Reacher), with no held-out layouts.
+  - Probes: pose decodes well (r ≈ 0.97–0.99), but rotation and velocity decode poorly (Cube joint velocity
+    r = 0.095).
+  - Surprise tests: teleport surprise is significant; colour change is not.
+  - Stated limitations: short horizons and low data diversity. Memory is not discussed.
+  - Zhang et al. 2026, *Frozen in a Frame* (arXiv:2610.04585): velocity probes on the released LeWM weights are at
+    or below chance.
+- **SIGReg** (LeJEPA, arXiv:2511.08544) fixes the batch marginal to N(0, I). *Which* information is kept is set by
+  the prediction task.
+- **Slow and predictable features win.** Sobal et al. 2022 (arXiv:2211.10831); Littwin et al. 2024 (NeurIPS,
+  arXiv:2407.03475; high-influence features); Tang et al. 2023 (ICML; the most persistent eigenmodes).
+  - H-JEPA (arXiv:2610.06805, App. L) defines "slow-feature collapse": an encoder keeps the episode-constant
+    background and drops the moving agent. This is "always feasible when the regularizer sees only the marginal
+    law".
+  - Liu et al. 2026 (arXiv:2607.26924): raw LeWM "biases variance allocation toward the temporally persistent
+    component". Their fix applies SIGReg to temporally centred residuals.
+- **Input is not target.** PokeWorld (Tan et al. 2026, arXiv:2607.27017): a quantity becomes decodable when it is
+  predicted, not when it is only given as input. In their RH20T table the trained input-only model reads it out
+  below an untrained network. This is the pattern of our state fusion.
+- **Global vs spatial latents.** DINO-WM (ICML 2025, arXiv:2411.04983), CLS vs patch success: Wall 0.58 vs 0.96,
+  PushT 0.44 vs 0.90, unseen layouts 0.64 vs 0.82.
 
-## 6. Minimal architecture changes to test the hypothesis
+### 3.2 How memory gets into reconstruction-free predictive models
 
-Hypothesis: *a JEPA latent world model can keep out-of-view obstacles if (i) its latent encodes the geometry,
-(ii) it has somewhere to keep the past, and (iii) its objective rewards keeping it.* LeWM currently fails all three.
+| model | belief (closed loop) | prediction (open loop) | target | anti-collapse | memory evidence |
+|---|---|---|---|---|---|
+| CPC\|Action (Guo et al. 2018, arXiv:1811.06407) | GRU over frame embeddings + actions | action-GRU, f ∈ [1, 30] | future frame embedding | contrastive | position loss on DMLab `terrain`: 30-step 1.589 vs 1-step 3.348; objects remembered after looking away **only when they later change observations** |
+| PBL (Guo et al. 2020, arXiv:2004.14646) | agent LSTM | 20 steps | future frame latent, **plus reverse: frame latent → belief** | stop-grad both ways | DMLab-30 gains; horizon 1 = no gain; red-cube position "much better remembered after the agent has looked away" |
+| BYOL-Explore (Guo et al. 2022, arXiv:2206.08332) | GRU | K = 8–10 | EMA frame embedding | EMA + stop-grad | DM-HARD-8: K=8 69.9 vs K=1 50.6 (partially observable only); fixed targets 19.9; longer training sequences (64→128) help |
+| NE-Dreamer (Bredis et al. 2026, arXiv:2603.02765) | RSSM + causal transformer | next step | **next** frame embedding | Barlow Twins | beats DreamerV3 on DMLab memory tasks; matching the *current* rather than the next embedding loses nearly all gains |
+| VAE+GRU (Memory Maze, arXiv:2210.13383) | GRU, truncated BPTT | next step | frozen VAE embedding (MSE) | frozen target | walls 90.0 % vs no-memory 84.1 % and RSSM-TBTT 94.0 % (9×9) |
+| ZP (Ni et al. 2024, ICLR, arXiv:2401.08898) | LSTM | next step | next belief (EMA) | EMA | MiniGrid memory tasks: ZP > model-free, but < observation prediction; EMA keeps belief rank, online/detached targets lose it |
 
-{{PLAN}}
+Mechanisms:
+- **Gregor et al. 2019** (arXiv:1906.09237): next-step targets give ∇_b L ≈ 0. Longer overshoot improves map and
+  position decoding, and deterministic predictors gain least.
+- **R2I** (ICLR 2024): a non-recurrent posterior q(z_t | o_t) "retains or elevates" memory performance, so memory
+  can live entirely in the sequence model. That is exactly the split of a single-frame LeWM encoder plus a
+  recurrent belief.
+- **Xie & Alanwar 2026** (arXiv:2610.07355): the V-JEPA 2 predictor loses a hidden moving object within 0.3 s
+  while its encoder still holds it. 3k predictor-only steps on occlusion data install it (belief 0.05 → 1.00):
+  "the deficit is not intrinsic to latent prediction; what persists changes with the masks and the data."
+- **JEPA-WMs** (Terver et al., TMLR 2026, arXiv:2512.24497): a 2-step rollout loss is best for planning in
+  simulation and 6 steps on DROID, and too-long training context hurts. Keep the planning head short-horizon even
+  if the belief is trained long.
+- **UWM-JEPA** (arXiv:2605.25313, toy): with teacher-forced belief targets the action pathway becomes inert
+  (‖H1‖/‖H0‖ ≈ 0.03). Test action sensitivity explicitly.
+
+### 3.3 Recurrent / memory JEPAs, 2025–26, and the gap
+
+| work | memory | tasks / evaluation |
+|---|---|---|
+| Sun & Zhu 2026, *Enhancing Latent World Models with Associative Memory* (arXiv:2610.19683) | content-addressable slot memory on JEPA prediction, multi-timescale | PushT, TwoRoom, Reacher, Cube: fully observable, long-horizon planning |
+| H-JEPA (arXiv:2610.06805) | hierarchy, no recurrence | AntMaze 18 → 73 % |
+| seq-JEPA (NeurIPS 2025, arXiv:2505.03176) | transformer over (view, action) | path integration over viewpoints; no control |
+| UWM-JEPA (arXiv:2605.25313) | density-matrix belief | toy hidden-velocity task |
+| EpicWorldModel (arXiv:2610.05996) | H-frame window, stochastic JEPA | success stratified by goal visibility: occluded goal 79.5 vs LeWM 33.3 |
+| InJePA (arXiv:2610.23896), Skytopia (arXiv:2609.26007), NWM (CVPR 2025) | 4–8-frame windows; Skytopia "lacks persistent spatial memory" | navigation success only |
+
+No work tests whether a JEPA world model's latent remembers content that left an egocentric view, and none
+regularises a recurrent belief with SIGReg. That is the gap.
+
+### 3.4 Spatial and ego-motion-structured memory
+
+- **GTM-SM** (Fraccaro et al., ICML 2018, arXiv:1804.09401) factorises a learned position state (integrated from
+  actions) from a frame code, with memory retrieved by position. It predicts coherently > 200 steps after
+  memorisation. This is the closest ancestor of our percept / ego-motion / belief split.
+- **TEM** (Whittington et al., Cell 2020): a path-integrated structural code plus a separate sensory code, bound in
+  memory and trained by next-observation prediction only.
+- **Flow Equivariant World Models** (Lillemark et al., ICML 2026, arXiv:2601.01075): a latent map larger than the
+  field of view, transported by the inverse self-motion. Block positions are decodable at 96 % (< 1 % for
+  baselines), and its equivariance error is a reusable label-free diagnostic. EgoMap (arXiv:2002.02286) stores
+  maps allocentrically to avoid resampling blur and tolerates ~10 % odometry noise.
+- **Conditions for ego-motion integration to emerge:**
+  - the objective requires it (multi-step prediction, positional targets);
+  - action input reaches the recurrent state;
+  - the data contains revisits;
+  - a capacity or noise bottleneck.
+
+  Evidence: Gregor; Levenstein et al. 2024; Cueva & Wei, ICLR 2018; Schaeffer et al., NeurIPS 2022 (integration
+  emerges easily when it is the target; grid codes do not, so test function, not tuning curves). Gornet & Thomson
+  (Nat. Mach. Intell. 2024): next-image prediction builds better spatial maps than an autoencoder on the same
+  data.
+- **Rich sensing allows reactive solutions without maps.** Wijmans et al. 2023 (ICLR) find occupancy in blind
+  agents' memories (IoU 32.5 % vs 12.5 % untrained), but nothing conclusive for depth-sighted agents.
+
+### 3.5 Evaluating memory without labels
+
+- **Re-entry / revisit consistency.**
+  - TECO (ICML 2023) builds data where content leaves view and returns; FVD saturates while long-range
+    consistency still improves.
+  - Po et al. 2025 (arXiv:2505.20171), backtrack retrieval: replay the inverse action sequence, and the ground
+    truth is the reversed past.
+  - WorldMem (arXiv:2504.12369): pose-indexed retrieval matters.
+- **Surprise / violation of expectation.** Garrido et al. 2025 (arXiv:2502.11831) define surprise as the latent
+  prediction error in a paired possible/impossible protocol, with an untrained-network control. LeWM's own
+  teleport test uses the same idea.
+- **Causal lesions and transplants.**
+  - Wijmans memory budget: truncate to the last k steps.
+  - Wijmans probe agent: an agent initialised with a predecessor's memory takes shortcuts, SPL 85.0 vs 62.9.
+  - Interchange interventions (Geiger et al., NeurIPS 2021).
+  - POPGym Arcade (arXiv:2503.01450): out-of-distribution inputs contaminate memory "well into the future".
+  - Shchendrigin et al. 2026 (arXiv:2601.15086): rewriting memory must be tested separately from retaining it.
+- **Probe after, not instead.** Probe decodability is not use (Xie & Alanwar: present in the encoder, absent from
+  the predictor). Memory Maze protocol: frozen states, MLP probe, scored after burn-in.
+
+### 3.6 Trap escape: memory vs planning horizon
+
+- AirDreamer (arXiv:2606.03252) credits the value function, "future returns beyond the rollout", and emergent yaw
+  scanning. It does not ablate memory.
+- TD-MPC (ICML 2022): finite-horizon MPC gives only locally optimal solutions, and a terminal value fixes it.
+- You et al. 2026 (arXiv:2607.10362): single-step latent error is "essentially uncorrelated with control success".
+- For LeWM the planner must therefore be fixed (value or longer horizon) *before* closed-loop trap success can
+  measure memory.
+
+## 4. V-JEPA 2-AC (verdict: no)
+
+V-JEPA 2-AC (arXiv:2506.09985) is a frozen ViT-g encoder (1B) with a ~300M block-causal predictor. It works on 256²
+RGB at 4 fps with 7-D end-effector actions, plans one step with CEM (800 × 10) to a goal image, and takes 16 s per
+action on an RTX 4090. Its checkpoint is 11.8 GB, against 14 GB of RAM here. There is no memory beyond an 8–16-frame
+context, and the released planner uses one context frame. V-JEPA 2.1 (arXiv:2603.14482) adds a distilled ViT-B
+(80M).
+
+On this laptop (≈10 TFLOP/s, an estimate), one plan takes ≈ 2 min per drone; 16 drones at 4 Hz need ~8000× the
+budget. It would also not test memory, it needs retraining for 5-D velocity actions and depth input, and there is
+no evidence that V-JEPA transfers to depth.
+
+The only use is an offline frozen perception baseline. For depth, DeFM-S (arXiv:2601.18923) or DINOv2-S is better
+evidenced. Section 2.3 already shows our own encoder's patch tokens hold the geometry, so a bigger encoder is not
+what is missing.
+
+## 5. Extension plan: R-LeWM
+
+Hypothesis: a reconstruction-free predictive latent keeps out-of-view obstacles if three conditions hold:
+- (i) its latent encodes the geometry;
+- (ii) it has a persistent state;
+- (iii) its objective and data make remembering pay off.
+
+LeWM currently fails all three. Each step below is one minimal change, evaluated against the previous step.
+
+### 5.1 Model ladder
+
+| step | change (code size) | addresses | expected effect |
+|---|---|---|---|
+| **M0 pixels-only** | `emb = proj(CLS)`; state concatenated to the action block in the predictor's AdaLN conditioning and given to the reward head (~10 lines, official-like) | §2.3 shortcut | held-out decoder/probe close to the random-init level or better; the train/held-out gap closes |
+| **M1 spatial tokens** | predictor over the CLS + a pooled patch grid (e.g. 3×5 = 16 tokens, 192-d); SIGReg per token | §2.3 coarse CLS; DINO-WM | visible-cell AP toward the frame CNN (≈ 0.33); still no memory |
+| **M2 recurrent belief** | GRU b_t = f(b_{t-1}, e_t, a_{t-1}), the predictor conditioned on b_t; an open-loop action-only head predicting e_{t+k}, k = 1…K (K ≈ 8–16 blocks = 2–4 s); targets = future frame embeddings; truncated BPTT on 32–64-frame sequences | §2.2, §3.2 | memory appears in b_t; re-entry error drops vs M1 for gaps up to ~K |
+| **M3 memory pressure** | look-away/look-back collection (yaw scans, trap exits) so that the reobs memory fraction ≫ 1 %; blind steps (observation dropout); up-weight re-entry frames | §2.2, Xie & Alanwar | memory horizon extends; tested by the M1/M2 metrics below |
+| M4 (optional) | ego-motion-equivariant belief (latent map transported by the known body motion, FloWM-style) | §3.4 | memory that survives yaw; a frame-aware belief |
+
+Design choices fixed by the literature:
+- Keep SIGReg and the BatchNorm projector on frame embeddings. MuDreamer finds BatchNorm crucial against collapse.
+- Monitor the belief's rank and within-episode variance; the belief is otherwise unregularised. SIGReg on the
+  belief is an experiment, not a recipe.
+- Ablate EMA / stop-gradient on the multi-step targets (Ni, BYOL-Explore).
+- Use a strict next-step shift (NE-Dreamer).
+- Optionally add PBL-style reverse prediction (frame embedding → belief).
+- Keep a short-horizon head for CEM (JEPA-WMs).
+
+The planner fix is orthogonal to memory but needed before closed-loop numbers mean anything: a value head on b_t
+(TD on embeddings, TD-MPC style) or a collision cost. Cost estimate: ≈ 3–5 h per 15k-step run on this laptop,
+extrapolated from the 30k-step LeWM run (5 h).
+
+### 5.2 Evaluation protocol (label-free first)
+
+| id | measure | what it shows |
+|---|---|---|
+| P0 | scripted look-away/look-back passes with gap Δ ∈ {5, 10, 20, 40, 80, 160} steps, each with a **novel twin** (same geometry never seen before) | controls: published LeWM, untrained network, M1 (no belief) |
+| E1 | **re-entry contrast**: latent prediction error on re-entering frames, novel − revisit, minus the same for the memoryless baseline, against Δ; plus backtrack retrieval | retention curve and half-life, without labels |
+| E2 | **surprise on layout edits** while the obstacle is out of view (removed, moved, added), paired protocol | the belief encodes *this* layout, not a template |
+| E3 | **lesions**: reset b to its init k steps before re-entry; shuffle b across layouts; ablate ego-motion during the gap; blind the percept during the gap; transplant b from another pass through the same layout | causality, effective horizon, path integration |
+| E4 | **closed loop**: CEM trap escape with intact / reset / transplanted belief, stratified by initial obstacle visibility | memory used for control |
+| E5 | occupancy probe (existing `probe/probe.py`) on b, with untrained and memoryless controls | corroboration; comparable to the Dreamer reference |
+
+Statistics: ≥ 3 seeds, paired tests, bootstrap confidence intervals. Pitfall: re-entry frames have higher error by
+nature, so the novel twin and the memoryless baseline are mandatory.
+
+### 5.3 Component analyses that carry over to multi-agent world models
+
+| analysis | single-agent result | multi-agent design decision |
+|---|---|---|
+| which component holds memory (percept e, ego-motion path, belief b), via E3 per component | where out-of-view information lives | communicate observation embeddings (MA-JEPA, arXiv:2609.33563) or beliefs (MAMBA, arXiv:2205.15023)? No paper compares the two for JEPAs |
+| rate curve: Gaussian-noise / quantisation bottleneck on b, E1/E4 against bits (½·log₂(1 + SNR) per dimension; cross-checked with CCA / KSG) | how many bits obstacle memory needs | message budget (MAMBA sends 160 bits; V2VNet 417× compression; IMAC) |
+| reference frame: equivariance error of b under known ego-motion; transplant with a pose offset, with and without a transform; pose noise 0–20 % | is the belief egocentric? | must messages carry a pose and be warped (V2VNet), or can they be fused directly? |
+| half-life (E1) and contamination (transplant a conflicting belief, measure the overwrite time) | how stale a belief may be; how fast observations correct it | message freshness and trust |
+| belief fusion: A saw the left wall, B saw the right; average vs pseudo-observation injection vs learned fusion, scored by E1/E2 on both walls | whether beliefs compose | the fusion operator; no study exists for JEPA beliefs |
+
+## 6. Risks and open questions
+
+- **Untrained belief targets.** Multi-step targets from the same online encoder, with no EMA, could co-adapt
+  (JEPA-x, arXiv:2608.24044). Ablate EMA targets.
+- **Slow-feature collapse of the belief** into an episode constant (H-JEPA App. L). Monitor the within-episode
+  variance of b.
+- **Memory pressure from data may still be small** for a scripted pilot. Check the reobs fraction on the new data
+  before training (target ≥ 10 % of re-entry content).
+- **CEM vs RL.** The closed-loop comparison with the Dreamer reference stays confounded by the planner (§3.6). Keep
+  claims about memory to E1–E3, and use E4 only within LeWM variants.
+- **Stand-in simulator.** All of this is on the kinematic stand-in (analytic depth). Isaac Sim is blocked by
+  driver 595 on this machine.
 
 ## References
 
-LeWM 2603.19312 · le-wm code (8edfeb3) · LeJEPA 2511.08544 · Sobal et al. 2211.10831 · Littwin et al.
-2407.03475 · Tang et al. 2212.03319 · Ni et al. 2401.08898 · TC-SIGReg 2607.26924 · PokeWorld 2607.27017 ·
-Spectral-target 2609.04264 · Frozen in a Frame 2610.04585 · DINO-WM 2411.04983 · PLDM 2502.14819 · JEPA-WMs
-2512.24497 · TD-MPC 2203.04955 · TD-MPC2 2310.16828 · You et al. 2607.10362 · Memory Maze 2210.13383 · R2I
-2403.04253 · Gregor et al. 1906.09237 · S4WM 2307.02064 · TECO 2210.02396 · Po et al. 2505.20171 · WorldMem
-2504.12369 · POPGym 2303.01859 · Garrido et al. 2502.11831 · Xie & Alanwar 2610.07355 · Wijmans et al. 2301.13261 ·
-MAD 2606.04534 · AirDreamer 2606.03252 · Meijer et al. 2407.13530 · V-JEPA 2 2506.09985 · V-JEPA 2.1 2603.14482 ·
-DeFM 2601.18923 · DreamerV3 2301.04104 (Nature 2025).
+LeWM 2603.19312 · le-wm code (8edfeb3) · LeJEPA 2511.08544 · Frozen in a Frame 2610.04585 · Sobal et al. 2211.10831 ·
+Littwin et al. 2407.03475 · Tang et al. 2212.03319 · H-JEPA 2610.06805 · TC-SIGReg 2607.26924 · PokeWorld 2607.27017 ·
+JEPA-x 2608.24044 · DINO-WM 2411.04983 · CPC|Action 1811.06407 · PBL 2004.14646 · BYOL-Explore 2206.08332 ·
+NE-Dreamer 2603.02765 · Memory Maze 2210.13383 · Ni et al. 2401.08898 · Gregor et al. 1906.09237 · R2I 2403.04253 ·
+Xie & Alanwar 2610.07355 · JEPA-WMs 2512.24497 · UWM-JEPA 2605.25313 · MuDreamer 2405.15083 · Sun & Zhu 2610.19683 ·
+seq-JEPA 2505.03176 · EpicWorldModel 2610.05996 · InJePA 2610.23896 · Skytopia 2609.26007 · NWM 2412.03572 ·
+GTM-SM 1804.09401 · TEM (Cell 2020) · FloWM 2601.01075 · EgoMap 2002.02286 · Neural Map 1702.08360 · Cueva & Wei
+1803.07770 · Schaeffer et al. (NeurIPS 2022) · Gornet & Thomson 2308.10913 · Wijmans et al. 2301.13261 · TECO
+2210.02396 · Po et al. 2505.20171 · WorldMem 2504.12369 · Garrido et al. 2502.11831 · Geiger et al. 2106.02997 ·
+POPGym Arcade 2503.01450 · Shchendrigin et al. 2601.15086 · AirDreamer 2606.03252 · TD-MPC 2203.04955 · You et al.
+2607.10362 · V-JEPA 2 2506.09985 · V-JEPA 2.1 2603.14482 · DeFM 2601.18923 · MA-JEPA 2609.33563 · MAMBA 2205.15023 ·
+V2VNet 2008.07519 · IMAC 1911.06992 · DreamerV3 2301.04104.

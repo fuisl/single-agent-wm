@@ -32,8 +32,10 @@ optimizer:
   weight_decay: 1e-3
 
 loss:
+  state_weight: 1.0      # TokenJEPA / BeliefJEPA: next-state (proprio) prediction loss
   sigreg:
     weight: 0.09
+    positions: 16        # TokenJEPA / BeliefJEPA: token positions per step (random subset)
     kwargs:
       knots: 17
       num_proj: 1024
@@ -41,3 +43,8 @@ loss:
 hydra:
   run:
     dir: ${run_dir}/hydra
+
+blind:                   # BeliefJEPA (M3): spans of frames with the image withheld from the belief
+  prob: 0.0
+  min: 2
+  max: 12

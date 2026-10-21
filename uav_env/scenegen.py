@@ -335,10 +335,13 @@ class Behaviour:
     modes: "goal"    plan straight to the goal (with noise)
            "explore" visit 2-4 random free waypoints with a wandering yaw offset, then the goal
            "trap"    fly into a trap cavity, look around, then leave for the goal
+    glance_rate > 0 (any mode): per step, the chance to start a glance, i.e. look 90-150 deg away from the flight
+    direction for 1-4.5 s and back, so that seen obstacles leave the view and return (memory-rich data, kin_v2)
     """
 
-    def __init__(self, scene, mode, rng):
+    def __init__(self, scene, mode, rng, glance_rate=0.0):
         self.scene, self.mode, self.rng = scene, mode, rng
+        self.glance_rate, self.glance_left, self.glance_off = glance_rate, 0, 0.0
         self.speed = rng.uniform(0.8, 1.5)
         self.sigma = rng.uniform(0.1, 0.35)
         self.z_ref = rng.uniform(1.2, 1.8)
@@ -386,13 +389,19 @@ class Behaviour:
             d = la - pos2
             clear = min_dist(pos2[None], self.scene.boxes)[0] if len(self.scene.boxes) else 9.0
             v = self.speed * np.clip((clear - 0.35) / 1.0, 0.25, 1.0)
+            if self.glance_left == 0 and self.rng.random() < self.glance_rate:
+                self.glance_left = int(self.rng.integers(20, 90))
+                self.glance_off = self.rng.choice([-1, 1]) * self.rng.uniform(np.deg2rad(90), np.deg2rad(150))
+            if self.glance_left > 0:
+                self.glance_left -= 1
+                v *= 0.6
             v_xy = v * d / max(np.linalg.norm(d), 1e-6)
             if np.linalg.norm(d) < 1e-3:
                 v_xy = np.zeros(2)
             self.yaw_off = 0.97 * self.yaw_off + self.yaw_off_sigma * 0.2 * self.rng.standard_normal()
             self.yaw_off = np.clip(self.yaw_off, -0.9, 0.9)
             heading = np.arctan2(v_xy[1], v_xy[0]) if np.linalg.norm(v_xy) > 0.05 else yaw
-            yaw_cmd = heading + self.yaw_off
+            yaw_cmd = heading + self.yaw_off + (self.glance_off if self.glance_left > 0 else 0.0)
         vz = np.clip(1.5 * (self.z_ref + 0.2 * np.sin(0.3 * t) - pos[2]), -0.5, 0.5)
         c, s = np.cos(yaw), np.sin(yaw)
         v_body = np.array([c * v_xy[0] + s * v_xy[1], -s * v_xy[0] + c * v_xy[1], vz])

@@ -94,3 +94,66 @@ class JEPA(nn.Module):
         alive = torch.cat([torch.ones_like(alive[:, :1]), alive[:, :-1]], 1)  # reward of the step that terminates counts
         ret = (alive * reward).sum(1)
         return -rearrange(ret, "(b s) -> b s", b=B)
+
+
+#########################################################################
+## R-LeWM variants (docs/lewm_memory_review.md §5). Pixels-only        ##
+## embeddings (official LeWM); the body state is a separate input and  ##
+## prediction target (proprio, as in DINO-WM / JEPA-WMs).              ##
+#########################################################################
+
+def encode_tokens(encoder, projector, pixels, spatial):
+    """(B, T, 1, H, W) -> (B, T, N, D): the CLS token, plus the 6x10 patch grid average-pooled to 3x5 if spatial."""
+    b = pixels.size(0)
+    hs = encoder(rearrange(pixels.float(), "b t ... -> (b t) ...")).last_hidden_state
+    tok = hs[:, :1]
+    if spatial:
+        grid = rearrange(hs[:, 1:], "n (h w) d -> n d h w", h=6)
+        tok = torch.cat([tok, rearrange(torch.nn.functional.avg_pool2d(grid, 2), "n d h w -> n (h w) d")], 1)
+    n = tok.size(1)
+    emb = projector(tok.flatten(0, 1)).view(-1, n, tok.size(-1))
+    return rearrange(emb, "(b t) n d -> b t n d", b=b)
+
+
+class TokenJEPA(nn.Module):
+    """M0 (spatial=False, 1 token per frame) and M1 (spatial=True, 16 tokens per frame); TokenPredictor over a
+    window of history_size frames."""
+
+    def __init__(self, encoder, predictor, action_encoder, projector, pred_proj, spatial=False):
+        super().__init__()
+        self.encoder, self.predictor, self.action_encoder = encoder, predictor, action_encoder
+        self.projector, self.pred_proj, self.spatial = projector, pred_proj, spatial
+
+    def encode(self, info):
+        info["emb"] = encode_tokens(self.encoder, self.projector, info["pixels"], self.spatial)
+        if "action" in info:
+            info["act_emb"] = self.action_encoder(info["action"])
+        return info
+
+    def predict(self, emb, state, act_emb):
+        """emb (B, T, N, D), state (B, T, S), act_emb (B, T, D) -> next tokens (B, T, N, D), next states (B, T, S)"""
+        out, s_next = self.predictor(emb, state, act_emb)
+        return self.pred_proj(out.flatten(0, 2)).view_as(out), s_next
+
+    def rollout(self, emb, state, action, n_steps, history_size=3):
+        """emb (M, H, N, D), state (M, H, S), action (M, H - 1 + n_steps, A) -> predicted (M, n, N, D), (M, n, S)"""
+        H = emb.size(1)
+        act_emb = self.action_encoder(action)
+        for t in range(n_steps):
+            pe, ps = self.predict(emb[:, -history_size:], state[:, -history_size:], act_emb[:, :H + t][:, -history_size:])
+            emb, state = torch.cat([emb, pe[:, -1:]], 1), torch.cat([state, ps[:, -1:]], 1)
+        return emb[:, H:], state[:, H:]
+
+
+class BeliefJEPA(nn.Module):
+    """M2 / M3: the TokenJEPA encoder with a recurrent belief and an open-loop multi-step predictor (module.Belief)
+    in place of the windowed transformer."""
+
+    def __init__(self, encoder, projector, belief, spatial=True, horizon=8):
+        super().__init__()
+        self.encoder, self.projector, self.belief = encoder, projector, belief
+        self.spatial, self.horizon = spatial, horizon
+
+    def encode(self, info):
+        info["emb"] = encode_tokens(self.encoder, self.projector, info["pixels"], self.spatial)
+        return info

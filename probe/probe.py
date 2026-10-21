@@ -79,8 +79,11 @@ def load(name_dirs):
         age = age.astype(np.int16)                          # <= 10_000; halves the largest label array in RAM
         f0 = np.load(os.path.join(first, n))
         split = str(f0["split"]) if "split" in f0.files else ("val" if is_val(n) else "train")
-        ep = {"name": n, "split": split, "occ": d["occ"], "seen": d["seen"], "vis": d["vis"],
-              "age": age, "depth": d["depth"]}
+        ep = {"name": n, "split": split, "occ": d["occ"]}         # RAM: train episodes only need the target
+        if split == "val":
+            ep.update(seen=d["seen"], vis=d["vis"], age=age)
+        if split == "val" or not args.no_frame:          # val depth: open-loop error plot
+            ep["depth"] = d["depth"]
         for k, dd in name_dirs.items():
             f = np.load(os.path.join(dd, n))
             # any world model: either a single "feat" array (T, D) or DreamerV3's deter + stoch
@@ -159,14 +162,19 @@ def predict(model, X):
     model.eval()
     out = []
     for k in range(0, len(X), 1024):
-        out.append(torch.sigmoid(model(torch.as_tensor(X[k:k + 1024], device=dev).float())).cpu().numpy())
+        out.append(torch.sigmoid(model(torch.as_tensor(X[k:k + 1024], device=dev).float())).half().cpu().numpy())
     return np.concatenate(out)
 
 
-def avg_precision(score, label, bins=1000):
-    """Threshold-free average precision via a score histogram (exact up to bin width)."""
-    h_pos = np.bincount(np.minimum((score[label] * bins).astype(int), bins - 1), minlength=bins)[::-1]
-    h_neg = np.bincount(np.minimum((score[~label] * bins).astype(int), bins - 1), minlength=bins)[::-1]
+def avg_precision(score, label, bins=1000, chunk=1 << 24):
+    """Threshold-free average precision via a score histogram (exact up to bin width); chunked for RAM."""
+    h_pos, h_neg = np.zeros(bins, np.int64), np.zeros(bins, np.int64)
+    for k in range(0, len(score), chunk):
+        b = np.minimum((score[k:k + chunk].astype(np.float32) * bins).astype(np.int32), bins - 1)
+        lab = label[k:k + chunk]
+        h_pos += np.bincount(b[lab], minlength=bins)
+        h_neg += np.bincount(b[~lab], minlength=bins)
+    h_pos, h_neg = h_pos[::-1], h_neg[::-1]
     tp, fp = np.cumsum(h_pos), np.cumsum(h_neg)
     if tp[-1] == 0:
         return 0.0
@@ -222,6 +230,11 @@ for name in sets:
     preds[name] = pr.astype(np.float16)                     # only used for the example figure
     print(json.dumps({name: {g: results[name][g] for g in ("vis", "mem", "unseen")}}), flush=True)
 json.dump(results, open(os.path.join(args.out, "probe_results.json"), "w"), indent=1)
+# per-step probe maps of the val trap episodes, for videos (scripts/viz)
+offs = np.cumsum([0] + [len(e["occ"]) for e in va])
+traps = [i for i, e in enumerate(va) if "_trap_" in e["name"]]
+np.savez_compressed(os.path.join(args.out, "trap_preds.npz"),
+                    **{f"{name}/{va[i]['name']}": preds[name][offs[i]:offs[i + 1]] for name in sets for i in traps})
 
 # ---------------------------------------------------------------- figures
 import matplotlib

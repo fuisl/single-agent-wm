@@ -72,15 +72,16 @@ class Attention(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, causal=True):
+    def forward(self, x, causal=True, attn_mask=None):
         """
-        x : (B, T, D)
+        x : (B, T, D); attn_mask (T, T) bool (True = attend) replaces the causal mask when given
         """
         x = self.norm(x)
         drop = self.dropout if self.training else 0.0
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop,
+                                             is_causal=causal and attn_mask is None)
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
 
@@ -102,11 +103,11 @@ class ConditionalBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), attn_mask=attn_mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -122,8 +123,8 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, attn_mask=None):
+        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -170,7 +171,7 @@ class Transformer(nn.Module):
                 block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
             )
 
-    def forward(self, x, c=None):
+    def forward(self, x, c=None, attn_mask=None):
 
         if hasattr(self, "input_proj"):
             x = self.input_proj(x)
@@ -179,7 +180,7 @@ class Transformer(nn.Module):
             c = self.cond_proj(c)
 
         for block in self.layers:
-            x = block(x) if isinstance(block, Block) else block(x, c)
+            x = block(x, attn_mask=attn_mask) if isinstance(block, Block) else block(x, c, attn_mask=attn_mask)
         x = self.norm(x)
 
         if hasattr(self, "output_proj"):
@@ -323,6 +324,20 @@ class DepthDecoder(nn.Module):
         return torch.sigmoid(self.net(x)[:, 0])
 
 
+class PatchDecoder(nn.Module):
+    """(D, 6, 10) patch-token grid -> 48x80 depth in [0, 1], the same up-sampling stack as DepthDecoder."""
+
+    def __init__(self, input_dim, ch=64):
+        super().__init__()
+        up = lambda i, o: [nn.ConvTranspose2d(i, o, 4, 2, 1), nn.GroupNorm(8, o), nn.GELU()]
+        self.net = nn.Sequential(nn.Conv2d(input_dim, 4 * ch, 1), *up(4 * ch, 2 * ch), *up(2 * ch, ch), *up(ch, ch),
+                                 nn.Conv2d(ch, 1, 3, padding=1))
+
+    def forward(self, x):
+        """x: (N, D, 6, 10) -> (N, 48, 80)"""
+        return torch.sigmoid(self.net(x)[:, 0])
+
+
 class RewardHead(nn.Module):
     """Embedding -> (reward, terminal logit) for the reward received on arriving at that observation."""
 
@@ -333,3 +348,139 @@ class RewardHead(nn.Module):
     def forward(self, emb):
         out = self.net(emb)
         return out[..., 0], out[..., 1]
+
+
+#################################################
+## R-LeWM (docs/lewm_memory_review.md §5)      ##
+#################################################
+
+class TokenPredictor(nn.Module):
+    """ARPredictor over several tokens per frame (M0 / M1): N pixel tokens + 1 proprio token per frame, frame-causal
+    attention (a token sees every token of its own and earlier frames), AdaLN action conditioning per frame.
+    The pixel-token outputs at frame t predict the pixel tokens of frame t+1, the proprio output the next state."""
+
+    def __init__(self, *, num_frames, num_tokens, state_dim, depth, heads, mlp_dim, input_dim, hidden_dim,
+                 dim_head=64, dropout=0.0):
+        super().__init__()
+        self.frame_pos = nn.Parameter(torch.randn(1, num_frames, 1, input_dim))
+        self.token_pos = nn.Parameter(torch.randn(1, 1, num_tokens + 1, input_dim))
+        self.state_in = nn.Linear(state_dim, input_dim)
+        self.state_out = nn.Linear(input_dim, state_dim)
+        self.transformer = Transformer(input_dim, hidden_dim, input_dim, depth, heads, dim_head, mlp_dim, dropout,
+                                       block_class=ConditionalBlock)
+
+    def forward(self, x, s, c):
+        """x: (B, T, N, D) pixel tokens, s: (B, T, S) normalised state, c: (B, T, D) action embedding
+        returns (B, T, N, D) pixel-token outputs, (B, T, S) next-state predictions"""
+        B, T, N, D = x.shape
+        x = torch.cat([x, self.state_in(s)[:, :, None]], 2) + self.frame_pos[:, :T] + self.token_pos
+        frame = torch.arange(T, device=x.device).repeat_interleave(N + 1)
+        mask = frame[:, None] >= frame[None, :]
+        out = self.transformer(x.flatten(1, 2), c.repeat_interleave(N + 1, 1), attn_mask=mask)
+        out = out.view(B, T, N + 1, D)
+        return out[:, :, :N], self.state_out(out[:, :, N])
+
+
+class Belief(nn.Module):
+    """Recurrent belief over frame embeddings (M2 / M3), after CPC|Action / PBL / BYOL-Explore:
+      closed loop  b_t = GRU(b_{t-1}, [z_t, s_t, a_{t-1}])     (z_t replaced by a learned blind vector when masked)
+      open loop    o_0 = b_t, o_k = GRU'(o_{k-1}, a_{t+k-1})   (actions only)
+      heads        o_k -> next pixel tokens z_{t+k}, next state s_{t+k}"""
+
+    def __init__(self, num_tokens, token_dim, state_dim, action_dim, belief_dim=1024, input_dim=512):
+        super().__init__()
+        self.num_tokens, self.token_dim = num_tokens, token_dim
+        self.obs_in = nn.Sequential(nn.Linear(num_tokens * token_dim + state_dim + action_dim, input_dim),
+                                    nn.LayerNorm(input_dim), nn.SiLU())
+        self.blind = nn.Parameter(torch.zeros(num_tokens * token_dim))
+        self.closed = nn.GRUCell(input_dim, belief_dim)
+        self.act_in = nn.Sequential(nn.Linear(action_dim, input_dim), nn.LayerNorm(input_dim), nn.SiLU())
+        self.open = nn.GRUCell(input_dim, belief_dim)
+        self.token_head = MLP(belief_dim, 2048, num_tokens * token_dim, norm_fn=nn.BatchNorm1d)
+        self.state_head = MLP(belief_dim, 512, state_dim)
+        self.belief_dim = belief_dim
+
+    def observe(self, z, s, a_prev, blind=None, b0=None, reset=None):
+        """z: (B, T, N, D), s: (B, T, S), a_prev: (B, T, A) action block that led to frame t (zeros at t=0),
+        blind: (B, T) bool, reset: (B, T) bool (belief set to b0/zeros before step t). Returns (B, T, belief_dim)."""
+        B, T = z.shape[:2]
+        z = z.flatten(2)
+        if blind is not None:
+            z = torch.where(blind[..., None], self.blind.to(z.dtype).expand_as(z), z)
+        x = self.obs_in(torch.cat([z, s, a_prev], -1).float())
+        b = torch.zeros(B, self.belief_dim, device=z.device) if b0 is None else b0
+        out = []
+        for t in range(T):
+            if reset is not None:
+                b = torch.where(reset[:, t, None], torch.zeros_like(b), b)
+            b = self.closed(x[:, t], b)
+            out.append(b)
+        return torch.stack(out, 1)
+
+    def imagine(self, b, actions):
+        """b: (M, belief_dim), actions: (M, K, A) -> pixel tokens (M, K, N, D), states (M, K, S), open states (M, K, Bd)"""
+        o, outs = b, []
+        for k in range(actions.size(1)):
+            o = self.open(self.act_in(actions[:, k].float()), o)
+            outs.append(o)
+        o = torch.stack(outs, 1)
+        M, K = o.shape[:2]
+        tok = self.token_head(o.flatten(0, 1)).view(M, K, self.num_tokens, self.token_dim)
+        return tok, self.state_head(o.flatten(0, 1)).view(M, K, -1), o
+
+
+class MapBelief(Belief):
+    """M4: the belief is an ego-centric latent map (channels x size x size cells of cell_m metres, drone at the centre
+    facing up), transported by the drone's own motion and written by the current frame (in the spirit of Flow
+    Equivariant World Models / EgoMap):
+        M_t = (1 - g) * warp(M_{t-1}, ego-motion) + g * u,   [u, g] = lift(z_t, s_t)
+        b_t = readout(M_t)  (a small CNN), then the open-loop head of Belief, unchanged.
+    The ego-motion over one frame comes from the body state (velocity, yaw rate) at the previous frame, so nothing
+    beyond the proprioception the other variants already get is used."""
+
+    def __init__(self, num_tokens, token_dim, state_dim, action_dim, belief_dim=1024, input_dim=512,
+                 channels=32, size=16, cell_m=0.6, dt=0.25, vel_idx=(5, 6), yaw_rate_idx=10):
+        super().__init__(num_tokens, token_dim, state_dim, action_dim, belief_dim, input_dim)
+        del self.closed
+        self.channels, self.size, self.cell_m, self.dt = channels, size, cell_m, dt
+        self.vel_idx, self.yaw_rate_idx = list(vel_idx), yaw_rate_idx
+        self.lift = nn.Linear(input_dim, 2 * channels * size * size)
+        self.readout = nn.Sequential(
+            nn.Conv2d(channels, 64, 3, 2, 1), nn.GroupNorm(8, 64), nn.SiLU(),
+            nn.Conv2d(64, 128, 3, 2, 1), nn.GroupNorm(8, 128), nn.SiLU(),
+            nn.Flatten(), nn.Linear(128 * (size // 4) ** 2, belief_dim))
+        self.register_buffer("state_mean", torch.zeros(state_dim))
+        self.register_buffer("state_std", torch.ones(state_dim))
+
+    def warp(self, m, s):
+        """Move map content by the inverse ego-motion of one frame. m: (B, C, S, S), s: normalised state (B, D)."""
+        raw = s.float() * self.state_std + self.state_mean
+        v, w = raw[:, self.vel_idx] * self.dt, raw[:, self.yaw_rate_idx] * self.dt  # body-frame step, yaw change
+        half = self.size * self.cell_m / 2
+        c, sn = torch.cos(w), torch.sin(w)
+        # map axes: image x = body left (-y), image y = body backward (-x); output cell p samples input at R p + t
+        theta = torch.stack([torch.stack([c, sn, -v[:, 1] / half], -1),
+                             torch.stack([-sn, c, -v[:, 0] / half], -1)], 1)
+        grid = torch.nn.functional.affine_grid(theta, m.shape, align_corners=False)
+        return torch.nn.functional.grid_sample(m, grid, align_corners=False)
+
+    def observe(self, z, s, a_prev, blind=None, b0=None, reset=None, return_map=False):
+        """As Belief.observe; b0 / reset act on the map. b0: (B, C, S, S) map or None. Returns beliefs (B, T, Bd)."""
+        B, T = z.shape[:2]
+        z = z.flatten(2)
+        if blind is not None:
+            z = torch.where(blind[..., None], self.blind.to(z.dtype).expand_as(z), z)
+        x = self.obs_in(torch.cat([z, s, a_prev], -1).float())
+        m = torch.zeros(B, self.channels, self.size, self.size, device=z.device) if b0 is None else b0
+        out, maps = [], []
+        for t in range(T):
+            if reset is not None:
+                m = torch.where(reset[:, t, None, None, None], torch.zeros_like(m), m)
+            if t > 0:
+                m = self.warp(m, s[:, t - 1])
+            u, g = self.lift(x[:, t]).view(B, 2, self.channels, self.size, self.size).unbind(1)
+            g = torch.sigmoid(g - 2.0)  # mostly keep the map at init
+            m = (1 - g) * m + g * torch.tanh(u)
+            out.append(self.readout(m))
+            maps.append(m)
+        return (torch.stack(out, 1), torch.stack(maps, 1)) if return_map else torch.stack(out, 1)

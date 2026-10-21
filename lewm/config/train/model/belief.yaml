@@ -1,0 +1,28 @@
+# M2 / M3: TokenJEPA encoder + recurrent belief with an open-loop multi-step predictor
+_target_: jepa.BeliefJEPA
+spatial: true
+horizon: 8               # open-loop prediction horizon in frames (8 x 0.25 s = 2 s)
+
+encoder:
+  _target_: module.vit_depth
+  size: tiny
+  patch_size: 8
+  image_size: [48, 80]
+
+belief:
+  _target_: module.Belief
+  num_tokens: ${eval:'16 if ${model.spatial} else 1'}
+  token_dim: ${embed_dim}
+  state_dim: ???
+  action_dim: ???
+  belief_dim: 1024
+  input_dim: 512
+
+projector:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
