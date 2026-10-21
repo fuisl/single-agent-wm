@@ -5,6 +5,7 @@ config.json holds the resolved training config, the state / action z-score stats
 """
 import argparse
 import json
+import os
 from pathlib import Path
 
 import hydra
@@ -22,7 +23,10 @@ def export(ckpt_path, out):
     cfg = OmegaConf.to_container(OmegaConf.create(ckpt["cfg"]), resolve=True)
     stats = {k: [t.tolist() for t in v] for k, v in ckpt["stats"].items()}
     torch.save(ckpt["model"].state_dict(), out / "weights.pt")
-    (out / "config.json").write_text(json.dumps({"cfg": cfg, "stats": stats, "step": ckpt["step"]}, indent=1))
+    text = json.dumps({"cfg": cfg, "stats": stats, "step": ckpt["step"]}, indent=1)
+    if os.environ.get("WM_ROOT"):  # no local paths in the published config
+        text = text.replace(os.environ["WM_ROOT"], "$WM_ROOT")
+    (out / "config.json").write_text(text)
 
     model, _, _ = load_pretrained(out)  # round trip: same outputs as the pickled model
     ref = ckpt["model"].eval()

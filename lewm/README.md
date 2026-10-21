@@ -13,7 +13,7 @@ the official repo; `jepa.py` / `module.py` / `train.py` keep the official code a
 | `train_heads.py` | post-hoc readouts on the frozen encoder: depth decoder (visualisation) + reward / terminal head (planning) |
 | `extract.py` | per-step features for `probe/probe.py` + decoded reconstructions and open-loop imagination |
 | `solver.py`, `eval.py` | CEM model-predictive control through `uav_env/rl_server.py`, replacing DreamerV3's actor; config `config/eval/` |
-| `export_hf.py` | `weights.pt` + `config.json` export (official LeWM HF layout) and `load_pretrained`; weights at [fuisl/r-lewm-uav](https://huggingface.co/fuisl/r-lewm-uav) |
+| `export_hf.py`, `hf_example.py` | `weights.pt` + `config.json` export (official LeWM HF layout), `load_pretrained`, and a check of a downloaded model's losses; weights at [fuisloy/r-lewm-uav](https://huggingface.co/fuisloy/r-lewm-uav) |
 
 Differences from the official setup, all forced by the task:
 
