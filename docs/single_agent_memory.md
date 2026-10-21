@@ -1,7 +1,7 @@
 # Single-agent memory in a latent-predictive world model (R-LeWM)
 
-Status: 2026-10-21 22:35. M0 and M1 done, M2 training (≈ 2.7 h per run, eval included ≈ 3.2 h), M3–M4 queued
-(chain in tmux `lewm_gpu`, log `logs/lewm_chain.log`).
+Status: 2026-10-22 01:50. M0, M1 and M2 done, M3 training (started 01:35, ≈ 3.2 h with eval), M4 queued
+(chain in tmux `lewm_gpu`, log `logs/lewm_chain.log`). Weights: huggingface.co/fuisloy/r-lewm-uav.
 Companion documents:
 - `docs/lewm_memory_review.md`: the diagnosis, the literature review and the reasons for each design choice.
 - `docs/uav_memory_probe_kit.md`: the occupancy probe and the data format.
@@ -199,6 +199,8 @@ comparable. Across runs (rows grouped by run) the spread for the same features i
 | **M0 predictor output** | 3-frame window | 0.189 | 0.054 | 0.157 |
 | **M1 percept** | 16 tokens (CLS + 3×5 pooled patches), pixels only | 0.208 | 0.054 | 0.161 |
 | **M1 predictor output** | 3-frame window, 16 tokens | 0.193 | 0.053 | 0.164 |
+| **M2 percept** | 16 tokens, trained with the belief | 0.112 | 0.041 | 0.138 |
+| **M2 belief** | closed-loop GRU state b_t (1024-d) | 0.065 | **0.059** | 0.168 |
 
 Memory AP against steps since last visible (20 Hz; 10 steps = 0.5 s):
 
@@ -211,6 +213,8 @@ Memory AP against steps since last visible (20 Hz; 10 steps = 0.5 s):
 | M0 predictor output | 0.084 | 0.040 | 0.036 | 0.031 | 0.032 | 0.064 |
 | M1 percept | 0.091 | 0.042 | 0.037 | 0.031 | 0.033 | 0.065 |
 | M1 predictor output | 0.086 | 0.040 | 0.036 | 0.029 | 0.030 | 0.063 |
+| M2 percept | 0.059 | 0.029 | 0.027 | 0.026 | 0.028 | 0.057 |
+| **M2 belief** | 0.059 | **0.054** | **0.052** | **0.054** | 0.047 | 0.076 |
 
 What these numbers show:
 - **Removing state fusion fixes the representation (M0).** Visible AP rises 0.070 → 0.236. This confirms the
@@ -232,6 +236,18 @@ What these numbers show:
   The last one can be checked by probing the pooled tokens before the projector. M2–M4 build on M1's tokens, so
   this caps the visible-cell geometry available to the belief, but it does not affect the memory test, which
   contrasts a model with itself.
+- **M2's belief holds more about out-of-view cells than its own percept, but not much more than a single frame.**
+  - Memory AP is 0.059 for the belief against 0.041 for the percept.
+  - By age, the belief stays flat at ≈ 0.053 from 11 to 80 steps, where the percept falls to ≈ 0.027. That is
+    level with the frame CNN at 11–20 steps (0.053) and above it at 21–80 steps (0.041 and 0.034).
+  - Two caveats:
+    - The belief also takes the state as input. Its age curve lies almost exactly on the baseline `emb` curve
+      (0.048–0.054 from 11 to 160 steps), which §6.1 attributes to the layout prior that the state gives. So the
+      probe gain is most likely the state, not memory, until a state-ablated probe shows otherwise. The memory
+      test (§6.2) has no such confound, because the twins share the state.
+    - M2's percept lost geometry: visible AP fell from 0.208 (M1) to 0.112. Two things changed at once: the
+      gradient now comes only through the belief, and the batch is 16 windows of 32 frames instead of 128 windows
+      of 4.
 - **Memory AP has a structural floor.** It is never at chance, because part of the memory cells sits next to
   visible structure. The reference for "has memory" is therefore the frame CNN (0.062, and 0.151 at 1–10 steps),
   not 0.02.
@@ -243,9 +259,41 @@ What these numbers show:
 | baseline LeWM | all | 0.000 | 0.000 | 0 | 0.100 |
 | M0 | all | 0.000 | 0.000 | 0 | 0.437–0.441 |
 | M1 | all | 0.000 | 0.000 | 0 | 0.512–0.518 |
-| M2–M4 | *(queued)* | | | | |
+| M2 | see below | 0.0005 – 0.0021 | 0.0013 – 0.0047 | 0.62 – 0.93 | 0.531–0.546 |
+| M3–M4 | *(queued)* | | | | |
 
-As expected for window models (§5.2), this is the leak check. The first informative row is M2.
+As expected for window models (§5.2), the first three rows are the leak check. M2 is the first informative row.
+Its errors are normalised by the target variance; the bracket is ± 1 s.e. over the 60 scenarios.
+
+| M2, gap (steps) | E1 memory effect | E2 surprise | voe_acc | reset effect |
+|---|---|---|---|---|
+| 0 | 0.0005 ± 0.0009 (0.5 s.e.) | 0.0044 ± 0.0010 (4.2 s.e.) | 0.62 | 0.030 |
+| 10 | 0.0013 ± 0.0008 (1.7 s.e.) | 0.0047 ± 0.0009 (5.0 s.e.) | 0.77 | 0.030 |
+| 20 | **0.0020 ± 0.0007 (2.9 s.e.)** | 0.0040 ± 0.0006 (6.3 s.e.) | 0.80 | 0.032 |
+| 40 | **0.0021 ± 0.0005 (3.8 s.e.)** | 0.0033 ± 0.0005 (6.7 s.e.) | 0.85 | 0.031 |
+| 80 | **0.0017 ± 0.0003 (4.8 s.e.)** | 0.0023 ± 0.0003 (7.3 s.e.) | 0.93 | 0.031 |
+| 160 | **0.0010 ± 0.0002 (6.1 s.e.)** | 0.0013 ± 0.0002 (8.1 s.e.) | 0.90 | 0.029 |
+
+What M2 shows:
+- **The recurrent belief carries a real memory effect.**
+  - E1 is above 2 s.e. from gap 20 to gap 160 (1 s to 8 s out of view, plus 1.5 s of turning).
+  - The re-entry frames are pixel-identical and the states are the same, so the difference can only come from
+    the earlier sighting.
+  - The effect is **small**: 0.002 is ≈ 0.4 % of the re-entry error (0.54).
+- **Object permanence (E2) is the clearer signal.**
+  - Removing a wall the model saw raises its error at every gap (4–8 s.e.).
+  - The removed twin has the higher error in 62–93 % of scenarios (voe_acc).
+- **The profile is not the one predicted.**
+  - E1 is not significant at gaps 0–10 and peaks at 20–40.
+  - Both E1 and E2 shrink from 40 to 160 steps, while voe_acc rises with gap.
+  - Longer gaps put the scenarios at the edge of the 8 s training window or beyond it (§8). At those gaps the
+    errors are smaller and less variable, which may explain the high voe_acc.
+- **E3 is not informative for M2.**
+  - belief_share = 1.000 at every gap. This holds by construction: the GRU state is the only path from the past.
+    Swapping it at the turn-back therefore reproduces the novel run exactly.
+  - Reset (belief → 0) costs 0.03, 15× the memory effect, so the belief carries much more than the wall: pose,
+    scene layout and motion context.
+  - The lesion becomes a real test in M4, where it acts on the map alone.
 
 ### 6.3 Training curves (validation, at the end of training or latest)
 
@@ -253,6 +301,7 @@ As expected for window models (§5.2), this is the leak check. The first informa
 |---|---|---|---|---|
 | M0 (1 token) | 0.026 | 0.0035 | 2.01 | 2.4 h |
 | M1 (16 tokens) | 0.029 | 0.0043 | 2.07 | 3.4 h |
+| M2 (belief) | 0.017 (8-step mean), 0.0059 (1-step) | 0.0072 | 1.99 | 3.0 h (+ 0.6 h eval) |
 
 The prediction losses are not comparable across token counts: M1 also predicts 15 spatial tokens.
 
