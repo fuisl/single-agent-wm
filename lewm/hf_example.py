@@ -1,5 +1,5 @@
 """Losses of a downloaded checkpoint on the example episodes, with the same forward as training (from lewm/):
-    hf download fuisloy/r-lewm-uav --include "m1/*" "examples/*" --local-dir ../hf
+    hf download fuisloy/r-lewm-uav --include "m1/*" --include "examples/*" --local-dir ../hf
     python hf_example.py --model ../hf/m1 --data ../hf/examples
 """
 import argparse
@@ -17,6 +17,7 @@ def run(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, stats, cfg = load_pretrained(args.model, device)
     cfg = OmegaConf.create(cfg)
+    cfg.loss.sigreg.setdefault("positions", 16)  # M0 predates the subset; 16 covers all of its T * 1 positions
     print(f"{type(model).__name__}, {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
 
     eps = [load_episode(f) for f in episode_files(args.data, "all")]
