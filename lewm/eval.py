@@ -5,9 +5,10 @@ Start the server first with --extras (pos / yaw for trajectory logging):
     python eval.py run_dir=$WM_ROOT/runs/lewm port=6140 episodes=100
 Same seeded test suites and output format as dreamer/eval_rl.py: <run_dir>/eval_cem/<suite>.json.
 
-Every action_block env steps the current observation is encoded and appended to the embedding history; when
-the queued actions run out, CEM plans `horizon` blocks from the last history_size embeddings and the first
-receding_horizon blocks are executed.
+Every action_block rounds the current observations of all drones are encoded and appended to their embedding
+histories; drones whose queued actions ran out are replanned together (one batched CEM): `horizon` blocks from
+the last history_size embeddings, of which the first receding_horizon blocks are executed. After a reset a drone
+hovers until the next planning round (< 0.25 s) so that all drones share the planning clock.
 """
 import json
 import time
@@ -28,7 +29,7 @@ class Slot:
         self.reset()
 
     def reset(self):
-        self.t, self.emb, self.act, self.block, self.queue, self.mean = 0, [], [], [], [], None
+        self.emb, self.act, self.block, self.queue, self.mean = [], [], [], [], None
 
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="uav")
@@ -77,14 +78,14 @@ def run(cfg):
         for i, c in enumerate(conns):
             current[i] = queue.pop(0) if queue else None
             c.send(("reset", current[i] or {"kind": "random"}))
-        t0, plan_time = time.time(), 0.0
+        t0, plan_time, rnd = time.time(), 0.0, 0
         while any(x is not None for x in current):
             obs = [c.recv() for c in conns]
             for i, o in enumerate(obs):
                 if current[i] is not None:
                     traj[i].append([*o["pos"].tolist(), float(o["yaw"])])
-            live = [i for i, o in enumerate(obs) if current[i] is not None and not o["is_last"] and slots[i].t % k == 0]
-            if live:
+            live = [i for i, o in enumerate(obs) if current[i] is not None and not o["is_last"]]
+            if live and rnd % k == 0:  # every slot plans at the same rounds, so CEM runs batched over all drones
                 tp = time.time()
                 plan([slots[i] for i in live], [obs[i] for i in live])
                 plan_time += time.time() - tp
@@ -100,14 +101,16 @@ def run(cfg):
                     c.send(("reset", current[i] or {"kind": "random"}))
                 elif current[i] is None:
                     c.send(("step", HOVER))
+                elif not s.emb:  # new episode: hover (holding yaw) until the next planning round, < 1 block
+                    c.send(("step", np.array([0, 0, 0, np.cos(o["yaw"]), np.sin(o["yaw"])], np.float32)))
                 else:
                     a = s.queue.pop(0)
                     s.block.append(a)
                     if len(s.block) == k:  # block finished: keep it (normalised) as predictor context
                         s.act = (s.act + [a_norm(torch.as_tensor(np.concatenate(s.block), device="cuda"))])[-HS:]
                         s.block = []
-                    s.t += 1
                     c.send(("step", a.astype(np.float32)))
+            rnd += 1
         for c in conns:  # drain the replies to the last round so the next suite starts in lock-step
             c.recv()
         n = len(records)

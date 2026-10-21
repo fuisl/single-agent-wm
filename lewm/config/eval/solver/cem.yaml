@@ -1,7 +1,7 @@
 _target_: solver.CEMSolver
 model: ???
 heads: ???
-num_samples: 300
+num_samples: 300       # official LeWM values; scripts/pipeline.sh uses 128 / 10 / 16 for compute
 var_scale: 1.0
 n_steps: 30
 topk: 30

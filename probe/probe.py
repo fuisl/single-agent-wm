@@ -76,6 +76,7 @@ def load(name_dirs):
             age = np.load(cpath)["age"]
         else:
             age = ages_for(d); np.savez_compressed(cpath, age=age)
+        age = age.astype(np.int16)                          # <= 10_000; halves the largest label array in RAM
         f0 = np.load(os.path.join(first, n))
         split = str(f0["split"]) if "split" in f0.files else ("val" if is_val(n) else "train")
         ep = {"name": n, "split": split, "occ": d["occ"], "seen": d["seen"], "vis": d["vis"],
@@ -218,7 +219,7 @@ for name in sets:
         model = fit(MLPProbe(Xtr.shape[1]), Xtr, Ytr, args.epochs, stack(ho, name, 4), Yho)
         pr = predict(model, stack(va, name))
     results[name] = scores(pr, lab["occ"], lab["seen"], lab["vis"], lab["age"])
-    preds[name] = pr
+    preds[name] = pr.astype(np.float16)                     # only used for the example figure
     print(json.dumps({name: {g: results[name][g] for g in ("vis", "mem", "unseen")}}), flush=True)
 json.dump(results, open(os.path.join(args.out, "probe_results.json"), "w"), indent=1)
 
@@ -258,26 +259,31 @@ for a in ax.ravel():
     a.set_xticks([]); a.set_yticks([])
 fig.tight_layout(); fig.savefig(os.path.join(args.out, "probe_examples.png"), dpi=130)
 
-# open-loop imagination error vs horizon (first feature set, val episodes; DreamerV3 features only)
-first = list(name_dirs.values())[0]
-if "img_depth" not in np.load(os.path.join(first, va[0]["name"])).files:
+# open-loop imagination error vs horizon (val episodes), for every feature set that exports img_depth
+openloop = {}
+for name, fdir in name_dirs.items():
+    if "img_depth" not in np.load(os.path.join(fdir, va[0]["name"])).files:
+        continue
+    errs = {}
+    for e in va:
+        f = np.load(os.path.join(fdir, e["name"]))
+        T = int(f["chunk"]); img = f["img_depth"].astype(np.float32); rec = f["recon_depth"].astype(np.float32)
+        true = (e["depth"].astype(np.float32) - sg.D_MIN) / (sg.D_MAX - sg.D_MIN)
+        for t in range(len(true)):
+            k = t % T - T // 2 + 1
+            if k >= 1 and not np.isnan(img[t]).any():
+                errs.setdefault(k, []).append(np.abs(img[t] - true[t]).mean() * (sg.D_MAX - sg.D_MIN))
+        errs.setdefault(0, []).extend((np.abs(rec - true).mean((1, 2)) * (sg.D_MAX - sg.D_MIN)).tolist())
+    ks = sorted(errs)
+    openloop[name] = {"horizon_steps": ks, "depth_mae_m": [float(np.mean(errs[k])) for k in ks]}
+if not openloop:
     print("PROBE_DONE (no img_depth in features, open-loop plot skipped)", flush=True)
     raise SystemExit
-errs = {}
-for e in va:
-    f = np.load(os.path.join(first, e["name"]))
-    T = int(f["chunk"]); img = f["img_depth"].astype(np.float32); rec = f["recon_depth"].astype(np.float32)
-    true = (e["depth"].astype(np.float32) - sg.D_MIN) / (sg.D_MAX - sg.D_MIN)
-    for t in range(len(true)):
-        k = t % T - T // 2 + 1
-        if k >= 1 and not np.isnan(img[t]).any():
-            errs.setdefault(k, []).append(np.abs(img[t] - true[t]).mean() * (sg.D_MAX - sg.D_MIN))
-    errs.setdefault(0, []).extend((np.abs(rec - true).mean((1, 2)) * (sg.D_MAX - sg.D_MIN)).tolist())
-ks = sorted(errs)
-mae = [float(np.mean(errs[k])) for k in ks]
-json.dump({"horizon_steps": ks, "depth_mae_m": mae}, open(os.path.join(args.out, "openloop.json"), "w"))
-plt.figure(figsize=(5, 3.5)); plt.plot(ks, mae, marker=".")
+json.dump(openloop, open(os.path.join(args.out, "openloop.json"), "w"))
+plt.figure(figsize=(5, 3.5))
+for name, r in openloop.items():
+    plt.plot(r["horizon_steps"], r["depth_mae_m"], marker=".", label=name)
 plt.xlabel("imagination horizon (steps, 0 = posterior reconstruction)"); plt.ylabel("depth MAE (m)")
-plt.title("open-loop depth prediction error"); plt.tight_layout()
+plt.title("open-loop depth prediction error"); plt.legend(); plt.tight_layout()
 plt.savefig(os.path.join(args.out, "openloop_error.png"), dpi=130)
 print("PROBE_DONE", flush=True)

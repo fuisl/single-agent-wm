@@ -1,10 +1,14 @@
 #!/bin/bash
 # End-to-end smoke test on tiny data, every stage of the pipeline once. Stops at the first failure.
-#   bash scripts/quick_test.sh [stage ...]     stages: isaac collect dreamer lewm probe online
+#   [SIM=kin] bash scripts/quick_test.sh [stage ...]     stages: isaac collect dreamer lewm probe online
+# SIM=isaac (default) uses Isaac Sim; SIM=kin the kinematic stand-in (uav_env/kinsim.py), no Isaac.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source env.sh
-D=$WM_ROOT/data/wm_test R=$WM_ROOT/runs/test
+SIM=${SIM:-isaac}
+D=$WM_ROOT/data/${SIM}_test R=$WM_ROOT/runs/test_$SIM
+if [ $SIM = kin ]; then SERVER=kin_server.py PY_SERVER=$PY_MAIN; else SERVER=rl_server.py PY_SERVER=$PY_ISAAC; fi
+export SERVER
 STAGES=${*:-isaac collect dreamer lewm probe online}
 export XLA_PYTHON_CLIENT_MEM_FRACTION=${MEMFRAC:-0.6}
 
@@ -13,7 +17,11 @@ isaac() {
 }
 
 collect() {
-  $PY_ISAAC uav_env/collect.py --num_envs 4 --episodes 40 --max_steps 400 --out $D --validate
+  if [ $SIM = kin ]; then
+    $PY_MAIN uav_env/kin_collect.py --workers 12 --episodes 40 --max_steps 400 --out $D
+  else
+    $PY_ISAAC uav_env/collect.py --num_envs 4 --episodes 40 --max_steps 400 --out $D --validate
+  fi
 }
 
 dreamer() {
@@ -37,8 +45,8 @@ probe() {
     lewm=$R/lewm/features_ctx lewm_emb=$R/lewm/features_emb lewm_rand=$R/lewm/features_rand_ctx
 }
 
-serve() {  # serve <envs> <port> <log>: rl_server with --extras for evaluation; exits when its clients disconnect
-  $PY_ISAAC uav_env/rl_server.py --num_envs $1 --port $2 --extras > $3 2>&1 &
+serve() {  # serve <envs> <port> <log>: env server with --extras for evaluation; exits when its clients disconnect
+  $PY_SERVER uav_env/$SERVER --num_envs $1 --port $2 --extras > $3 2>&1 &
   until grep -q SERVER_READY $3; do kill -0 $! || { tail -20 $3; return 1; }; sleep 5; done
 }
 
@@ -47,7 +55,7 @@ online() {  # short DreamerV3 online run, then both controllers on two test suit
   serve 4 6151 $R/eval_dreamer_server.log
   $PY_DREAMER dreamer/eval_rl.py --logdir $R/rl --port 6151 --envs 4 --episodes 4 --suites random,utrap_in
   serve 4 6152 $R/eval_lewm_server.log
-  (cd lewm && $PY_MAIN eval.py run_dir=$R/lewm port=6152 envs=4 episodes=4 suites=random,utrap_in solver.n_steps=5)
+  (cd lewm && $PY_MAIN eval.py run_dir=$R/lewm port=6152 envs=4 episodes=4 "suites='random,utrap_in'" solver.n_steps=5)
 }
 
 mkdir -p $R

@@ -1,4 +1,5 @@
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 class CEMSolver:
@@ -25,7 +26,9 @@ class CEMSolver:
             cand = mean[:, None] + std[:, None] * noise
             cand[:, 0] = mean  # keep the current mean as a candidate
             cand = torch.maximum(torch.minimum(cand, high), low)
-            cost = self.model.get_cost(self.heads, emb, action_hist, cand, self.history_size)
+            # plain attention: the fused kernels are ~2x slower on 3-token sequences x thousands of candidates
+            with torch.autocast("cuda", dtype=torch.bfloat16), sdpa_kernel(SDPBackend.MATH):
+                cost = self.model.get_cost(self.heads, emb, action_hist, cand, self.history_size).float()
             elite = cand.gather(1, cost.topk(self.topk, 1, largest=False).indices[..., None, None]
                                 .expand(-1, -1, horizon, A))
             mean, std = elite.mean(1), elite.std(1)
