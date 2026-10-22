@@ -1,5 +1,7 @@
 """Shared drawing helpers for scripts/viz: chase-camera ray casting of the box world, box outlines, ego-map
 colouring and display names of feature sets / models."""
+import re
+
 import numpy as np
 
 import scenegen as sg
@@ -15,12 +17,13 @@ def label(k):
     if k in LABELS:
         return LABELS[k]
     m, _, part = k.partition("_")
-    return f"{m.upper()} {part}" if m[:1] == "m" and m[1:].isdigit() else k
+    return f"M{m[1:]} {part}" if re.fullmatch(r"m\d+s?", m) else k
 
 
 MODEL_LABELS = {"lewm": "LeWM (official, 3-frame window)", "m0": "M0 pixels-only + proprio",
-                "m1": "M1 + spatial tokens", "m2": "M2 + recurrent belief", "m3": "M3 + memory-rich data",
-                "m4": "M4 + ego-motion map", "wm": "DreamerV3 (reference)"}
+                "m1": "M1 + spatial tokens", "m2": "M2 + recurrent belief (collapsed encoder)",
+                "m2s": "M2s = M2 + SIGReg fix", "m3": "M3 + memory-rich data", "m4": "M4 + ego-motion map",
+                "wm": "DreamerV3 (reference)"}
 
 
 def model_label(run_name):

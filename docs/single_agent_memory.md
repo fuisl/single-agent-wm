@@ -1,8 +1,12 @@
 # Single-agent memory in a latent-predictive world model (R-LeWM)
 
-Status: 2026-10-22 11:30. M0–M4 done. **M2–M4 have a collapsed frame encoder** (§6.4), so their memory results
-are not yet evidence either way. The fix (§6.5, pre-registered) is training as M2s, then M3s / M4s if M2s passes
-the gate (tmux `lewm_gpu`, log `logs/lewm_sigfix.log`). Weights: huggingface.co/fuisloy/r-lewm-uav.
+Status: 2026-10-22 15:00. M0–M4 and M2s done.
+- **M2–M4 had a collapsed frame encoder** (§6.4), caused by SIGReg estimated on 16 samples.
+- **M2s** (M2 with SIGReg on 128 pooled frames, §6.5) recovered most of the encoder and gives the **first clear memory
+  result** (§6.6): E1 at 9–10 s.e. at every gap, 6–50× M2's relative size, decaying with time out of view, and
+  belief memory AP above the frame-only control at every age.
+- It missed the pre-registered rank gate narrowly (47.4 vs 50), so the chain stopped before M3s / M4s.
+- Weights: huggingface.co/fuisloy/r-lewm-uav (`m2s/`; M3 / M4 are not published).
 Companion documents:
 - `docs/lewm_memory_review.md`: the diagnosis, the literature review and the reasons for each design choice.
 - `docs/uav_memory_probe_kit.md`: the occupancy probe and the data format.
@@ -206,6 +210,8 @@ comparable. Across runs (rows grouped by run) the spread for the same features i
 | M3 belief | | 0.038 | 0.055 | 0.157 |
 | M4 percept | M3 with the map belief (collapsed encoder, §6.4) | 0.055 | 0.033 | 0.123 |
 | M4 belief | ego-centric latent map read-out | 0.038 | 0.055 | 0.156 |
+| **M2s percept** | M2 + SIGReg on 128 pooled frames (§6.5) | 0.164 | 0.053 | 0.158 |
+| **M2s belief** | | **0.196** | **0.081** | **0.200** |
 
 Memory AP against steps since last visible (20 Hz; 10 steps = 0.5 s):
 
@@ -219,7 +225,9 @@ Memory AP against steps since last visible (20 Hz; 10 steps = 0.5 s):
 | M1 percept | 0.091 | 0.042 | 0.037 | 0.031 | 0.033 | 0.065 |
 | M1 predictor output | 0.086 | 0.040 | 0.036 | 0.029 | 0.030 | 0.063 |
 | M2 percept | 0.059 | 0.029 | 0.027 | 0.026 | 0.028 | 0.057 |
-| **M2 belief** | 0.059 | **0.054** | **0.052** | **0.054** | 0.047 | 0.076 |
+| M2 belief | 0.059 | 0.054 | 0.052 | 0.054 | 0.047 | 0.076 |
+| M2s percept | 0.087 | 0.044 | 0.036 | 0.032 | 0.032 | 0.064 |
+| **M2s belief** | 0.138 | **0.096** | **0.077** | **0.065** | **0.051** | 0.085 |
 
 What these numbers show:
 - **Removing state fusion fixes the representation (M0).** Visible AP rises 0.070 → 0.236. This confirms the
@@ -267,10 +275,12 @@ What these numbers show:
 | M2 | see below | 0.0005 – 0.0021 | 0.0013 – 0.0047 | 0.62 – 0.93 | 0.531–0.546 |
 | M3 | all | **−0.033 → −0.007** (−3.5 to −3.7 s.e.) | 0.050 → 0.008 (3.8–4.6 s.e.) | 0.67–0.82 | 0.827–0.841 |
 | M4 | all | +0.003 → −0.005 (all < 2 s.e.) | 0.026 → 0.001 (3.0–4.6 s.e.) | 0.62–0.80 | **0.667 → 2.017** |
+| **M2s** | all | **0.025 → 0.006** (8.6–10.1 s.e.) | **0.026 → 0.003** (6.7–14 s.e.) | **0.87–1.00** | 0.539–0.545 |
 
 As expected for window models (§5.2), the first three rows are the leak check. M2 is the first informative row.
-The M3 and M4 rows come from collapsed encoders (§6.4), and their normaliser (target variance on the memtest
-frames) is 0.0035–0.0042 against 0.090 for M2, so their normalised numbers are not comparable with M2's.
+The M3 and M4 rows come from collapsed encoders (§6.4). The normaliser (target variance on the memtest frames)
+tracks the collapse: 0.0035–0.0042 for M3/M4, 0.090 for M2, 0.53 for M2s. Normalised effects are therefore not
+comparable across models; compare them **as a share of the model's own re-entry error** (M2 below, M2s in §6.6).
 Its errors are normalised by the target variance; the bracket is ± 1 s.e. over the 60 scenarios.
 
 | M2, gap (steps) | E1 memory effect | E2 surprise | voe_acc | reset effect |
@@ -312,9 +322,12 @@ What M2 shows:
 | M2 (belief) | 0.017 (8-step mean), 0.0059 (1-step) | 0.0072 | 1.99 | 3.0 h (+ 0.6 h eval) |
 | M3 (kin_v2, blind spans) | 0.020 / 0.012 | 0.0082 | 2.10 | 3.3 h |
 | M4 (map belief) | 0.021 / 0.013 | 0.0083 | 2.08 | 3.5 h |
+| M2s (SIGReg on 128 pooled frames) | 0.136 / 0.044 | 0.011 | 4.64 (N = 128) | 3.0 h (+ 1.1 h eval) |
 
-The prediction losses are not comparable across token counts: M1 also predicts 15 spatial tokens. The SIGReg
-values are not comparable across batch sizes either (§6.4): M0/M1 estimate it from 128 samples, M2–M4 from 16.
+The prediction losses are not comparable across token counts: M1 also predicts 15 spatial tokens. Nor across
+encoders: M2s's targets spread over ~6× more dimensions than M2's, so its higher loss is not worse prediction. The
+SIGReg values are not comparable across sample sizes either (§6.4): M0/M1/M2s estimate it from 128 samples, M2–M4
+from 16.
 
 ### 6.4 The frame encoder of M2–M4 collapsed
 
@@ -402,6 +415,72 @@ frames of the batch and draw 128 of them for the statistic.
 `gate_m2s` in `scripts/lewm_memory.sh`, and it fails the chain loudly otherwise. M3s and M4s are then judged against
 the M3 and M4 predictions of §7.
 
+### 6.6 M2s: the fix against its predictions
+
+M2s is M2 with `loss.sigreg.samples=128` and nothing else changed (kin_v1, seed 3072, 15k steps). Figure:
+`runs/kin_v1/viz/figures/mem_fix.png`.
+
+| pre-registered (§6.5) | M2 | prediction | **M2s** | verdict |
+|---|---|---|---|---|
+| CLS rank (gate) | 8.6 | ≥ 50 | **47.4** | missed, narrowly (M1 68) |
+| SIGReg at N = 128 (gate) | 9.9 | ≤ 3 | **2.79** | met (M0 1.92) |
+| visible AP, percept | 0.112 | ≥ 0.18 | **0.164** | missed (belief: 0.196) |
+| wall signal | 0.63 | ≥ 1.0 | **1.71** | met, above M0/M1 (1.49 / 1.44) |
+| E1 as % of re-entry error, gaps 20–80 | 0.37 / 0.38 / 0.31 | larger | **3.61 / 2.88 / 1.98** | met (8–10×) |
+
+**The diagnosis holds.** One change, the SIGReg sample count, moved the rank 5.5× and the wall signal 2.7×, and
+brought SIGReg at N = 128 under 3. The remaining gap to M1 (rank 47 vs 68, visible AP 0.164 vs 0.208) is a
+second, smaller effect: either the 8-step target still discards some geometry (§6.4), or the pooled frames are
+correlated, so the effective N is below 128. The training rank was still rising slowly when the learning rate
+reached 0 (val `percept_rank` 34.7 at 1k steps, 40.0 at 10k, 40.2 at 15k).
+
+**Memory test** (errors normalised by target variance 0.53; ± 1 s.e. over 60 scenarios; % = share of the seen
+re-entry error):
+
+| gap (steps) | E1 memory effect | E2 surprise | voe_acc | reset effect |
+|---|---|---|---|---|
+| 0 | **0.0253 ± 0.0028 (9.1 s.e., 4.7 %)** | 0.0256 ± 0.0018 (14.0 s.e.) | 1.00 | −0.024 (−4.5 %) |
+| 10 | **0.0219 ± 0.0023 (9.7 s.e., 4.0 %)** | 0.0209 ± 0.0015 (13.7 s.e.) | 1.00 | −0.028 |
+| 20 | **0.0196 ± 0.0019 (10.1 s.e., 3.6 %)** | 0.0169 ± 0.0013 (13.1 s.e.) | 1.00 | −0.027 |
+| 40 | **0.0157 ± 0.0016 (10.0 s.e., 2.9 %)** | 0.0121 ± 0.0010 (11.9 s.e.) | 1.00 | −0.028 |
+| 80 | **0.0108 ± 0.0011 (9.4 s.e., 2.0 %)** | 0.0071 ± 0.0007 (9.6 s.e.) | 0.95 | −0.028 |
+| 160 | **0.0062 ± 0.0007 (8.6 s.e., 1.1 %)** | 0.0032 ± 0.0005 (6.7 s.e.) | 0.87 | −0.029 (−5.3 %) |
+
+What M2s shows:
+- **A clear memory effect with the predicted profile.**
+  - E1 is 9–10 s.e. at every gap, including 0–10, where M2's was not significant.
+  - It decays monotonically with time out of view: 4.7 % of the re-entry error at 1.5 s, 1.1 % at 9.5 s. This is
+    the profile §7 predicted for M2.
+  - It is still present at gap 160 (9.5 s out of view), beyond the 8 s training window.
+- **Object permanence is near-perfect up to 3.5 s.** The removed-wall twin has the higher error in every scenario
+  at gaps 0–40 (voe_acc 1.00), and in 87–95 % at 80–160.
+- **The belief, not the state, holds the remembered obstacles** (probe, §6.1).
+  - Memory AP is 0.081 for the belief against 0.053 for its percept and 0.062 for the frame CNN. DreamerV3 is 0.105.
+  - By age, at 0.5–4 s out of view the belief scores 0.096 / 0.077 / 0.065. That is above the frame CNN
+    (0.053 / 0.041 / 0.034) and above the curve the state alone gives: baseline `emb` and M2's belief score
+    0.048–0.054 there.
+  - So the state-prior caveat of §6.1 no longer explains the gain. A state-ablated probe would close it (§8).
+- **Open: resetting the belief helps.** Zeroing the belief at the start of the turn-back lowers the re-entry error by
+  ≈ 5 % at every gap. For M2 it raised the error by 5.7 %.
+  - The remembered wall itself is in the belief: the swap reproduces E1 exactly.
+  - So the rest of what the belief carries from the hover and look-away hurts prediction of the turn-back. The
+    turn-back is also where every model's error peaks (`mem_traces.png`).
+  - Two candidate explanations:
+    - every training window starts from a zero belief, so a fresh start is the best-practised state of the
+      open-loop head;
+    - a 3 s hover followed by a 110–150° yaw is rare in kin_v1, so the motion context the belief carries mis-predicts
+      the turn.
+  - Check: reset at random points of held-out kin_v1 episodes. If the reset also helps there, the belief carries
+    harmful context in general.
+  - This does not affect E1 or E2, because the twins share everything but W.
+
+**The gate.** By the pre-registered rule, M2s failed the gate (rank 47.4 < 50), and the chain stopped before M3s.
+The rule's stated reading of a failure ("the collapse has another cause") does not fit: the change raised the rank
+5.5×, and every other prediction about the encoder was met except visible AP. Running M3s / M4s on this encoder
+would be a declared deviation from the gate. **Decision pending**, with two options:
+- (a) run M3s / M4s now;
+- (b) first close the remaining rank gap, then run them.
+
 ## 7. What would count as success, per milestone
 
 These are written down before the results land.
@@ -410,6 +489,7 @@ These are written down before the results land.
 |---|---|---|
 | **M1** | visible AP above M0 (0.236), towards the patch-token / frame-CNN level (0.28–0.33); memory AP unchanged; E1 = 0 | visible AP ≤ M0: pooled spatial tokens do not survive the JEPA objective |
 | **M2** | **E1 > 0** (≥ 2 s.e.) for gaps up to ~40 steps (2 s, the open-loop horizon), decaying with Δ; belief_share > 0.5; belief memory AP above its own percept and above the frame CNN at 11–40 steps; belief rank stays high | E1 ≈ 0 at all gaps with a healthy belief: multi-step prediction on kin_v1 does not demand memory (§5.1), and M3 becomes the critical test. E1 ≈ 0 with a collapsed rank: an optimisation problem, not a negative result |
+| | *Outcome.* M2 (collapsed encoder): E1 small and peaked at 20–40, probe gain explained by the state. **M2s: met.** E1 9–10 s.e. at all gaps, decaying; belief_share 1.0; belief memory AP above percept and frame CNN at 11–80 steps; belief rank 114 | |
 | **M3** | E1 extends to longer gaps (80–160 steps); **voe_acc > 0.5**, surprise > 0; memory AP rises in the 21–160 bins | no gain over M2: data and blind spans are not the bottleneck; the belief capacity or the 8 s training window is |
 | **M4** | the largest belief_share and the slowest decay with gap; memory AP towards the Dreamer reference (0.105); the decoded map shows W at the right place after the turn | no gain over M3: the GRU already path-integrates, or the warp (from the noisy state) hurts |
 
@@ -418,6 +498,11 @@ with memory AP above the frame-only control. The Dreamer reference shows the inf
 data; matching its 0.105 is not required for the claim.
 
 ## 8. Open issues and next steps
+
+- **M3s / M4s.** Pending the gate decision (§6.6).
+- **State-ablated probe.** Probe M2s's belief with the state input zeroed or shuffled, to confirm that the memory
+  AP gain is not the state.
+- **Reset helps M2s (§6.6).** Reset the belief at random points of held-out kin_v1 episodes.
 
 - **Seeds.** Every number is a single seed. Rerun the deciding rungs (M2 vs M3, and M4 if it differs) with 3 seeds
   before claiming anything.
