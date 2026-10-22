@@ -44,9 +44,22 @@ def lejepa_forward(model, sigreg, batch, cfg):
 
 def token_sigreg(sigreg, emb, cfg):
     """SIGReg per frame and token position ((T * N, B, D)) on a random subset of loss.sigreg.positions positions:
-    an unbiased estimate of the mean over all positions at a fraction of the memory."""
+    an unbiased estimate of the mean over all positions at a fraction of the memory.
+    With loss.sigreg.samples set: per token position ((N, samples, D)), on `samples` frames drawn from all B * T of
+    the batch (LeWM-Flat). The statistic scales with its sample count, so this keeps N = 128 when B is small."""
+    if cfg.loss.sigreg.get("samples"):
+        x = emb.permute(2, 0, 1, 3).flatten(1, 2)
+        return sigreg(x[:, torch.randperm(x.shape[1], device=x.device)[:cfg.loss.sigreg.samples]])
     x = emb.permute(1, 2, 0, 3).flatten(0, 1)
     return sigreg(x[torch.randperm(len(x), device=x.device)[:cfg.loss.sigreg.positions]])
+
+
+@torch.no_grad()
+def effective_rank(x):
+    """RankMe (Garrido et al. 2023) of (n, D) features: exp of the entropy of the normalised singular values."""
+    sv = torch.linalg.svdvals(x.float() - x.float().mean(0))
+    p = sv / sv.sum()
+    return torch.exp(-(p * torch.log(p + 1e-12)).sum())
 
 
 def token_forward(model, sigreg, batch, cfg):
@@ -65,6 +78,7 @@ def token_forward(model, sigreg, batch, cfg):
     output["state_loss"] = (pred_state - state[:, n_preds:]).pow(2).mean()
     output["sigreg_loss"] = token_sigreg(sigreg, emb, cfg)
     output["loss"] = output["pred_loss"] + cfg.loss.state_weight * output["state_loss"] + lambd * output["sigreg_loss"]
+    output["percept_rank"] = effective_rank(emb[:, :, 0].flatten(0, 1))  # collapse monitor on the CLS
     return output
 
 
@@ -104,17 +118,16 @@ def belief_forward(model, sigreg, batch, cfg):
     output["state_loss"] = (serr * valid).sum() / n
     output["sigreg_loss"] = token_sigreg(sigreg, emb, cfg)
     output["loss"] = output["pred_loss"] + cfg.loss.state_weight * output["state_loss"] + lambd * output["sigreg_loss"]
-    with torch.no_grad():  # collapse monitors: effective rank of the belief over the batch, within-window spread
-        flat = belief.flatten(0, 1).float()
-        sv = torch.linalg.svdvals(flat - flat.mean(0))
-        p = sv / sv.sum()
-        output["belief_rank"] = torch.exp(-(p * torch.log(p + 1e-12)).sum())
-        output["belief_time_std"] = belief.float().std(1).mean()
+    # collapse monitors: effective rank of the frame CLS and of the belief over the batch, within-window spread
+    output["percept_rank"] = effective_rank(emb[:, :, 0].flatten(0, 1))
+    output["belief_rank"] = effective_rank(belief.flatten(0, 1))
+    output["belief_time_std"] = belief.detach().float().std(1).mean()
     return output
 
 
 FORWARD = {"jepa.JEPA": lejepa_forward, "jepa.TokenJEPA": token_forward, "jepa.BeliefJEPA": belief_forward}
-LOG_KEYS = ("loss", "pred_loss", "pred1_loss", "state_loss", "sigreg_loss", "belief_rank", "belief_time_std")
+LOG_KEYS = ("loss", "pred_loss", "pred1_loss", "state_loss", "sigreg_loss", "percept_rank", "belief_rank",
+            "belief_time_std")
 
 
 def warmup_cosine(step, warmup, total):

@@ -1,7 +1,8 @@
 # Single-agent memory in a latent-predictive world model (R-LeWM)
 
-Status: 2026-10-22 01:50. M0, M1 and M2 done, M3 training (started 01:35, ≈ 3.2 h with eval), M4 queued
-(chain in tmux `lewm_gpu`, log `logs/lewm_chain.log`). Weights: huggingface.co/fuisloy/r-lewm-uav.
+Status: 2026-10-22 11:30. M0–M4 done. **M2–M4 have a collapsed frame encoder** (§6.4), so their memory results
+are not yet evidence either way. The fix (§6.5, pre-registered) is training as M2s, then M3s / M4s if M2s passes
+the gate (tmux `lewm_gpu`, log `logs/lewm_sigfix.log`). Weights: huggingface.co/fuisloy/r-lewm-uav.
 Companion documents:
 - `docs/lewm_memory_review.md`: the diagnosis, the literature review and the reasons for each design choice.
 - `docs/uav_memory_probe_kit.md`: the occupancy probe and the data format.
@@ -201,6 +202,10 @@ comparable. Across runs (rows grouped by run) the spread for the same features i
 | **M1 predictor output** | 3-frame window, 16 tokens | 0.193 | 0.053 | 0.164 |
 | **M2 percept** | 16 tokens, trained with the belief | 0.112 | 0.041 | 0.138 |
 | **M2 belief** | closed-loop GRU state b_t (1024-d) | 0.065 | **0.059** | 0.168 |
+| M3 percept | M2 on kin_v2 with blind spans (collapsed encoder, §6.4) | 0.053 | 0.033 | 0.123 |
+| M3 belief | | 0.038 | 0.055 | 0.157 |
+| M4 percept | M3 with the map belief (collapsed encoder, §6.4) | 0.055 | 0.033 | 0.123 |
+| M4 belief | ego-centric latent map read-out | 0.038 | 0.055 | 0.156 |
 
 Memory AP against steps since last visible (20 Hz; 10 steps = 0.5 s):
 
@@ -260,9 +265,12 @@ What these numbers show:
 | M0 | all | 0.000 | 0.000 | 0 | 0.437–0.441 |
 | M1 | all | 0.000 | 0.000 | 0 | 0.512–0.518 |
 | M2 | see below | 0.0005 – 0.0021 | 0.0013 – 0.0047 | 0.62 – 0.93 | 0.531–0.546 |
-| M3–M4 | *(queued)* | | | | |
+| M3 | all | **−0.033 → −0.007** (−3.5 to −3.7 s.e.) | 0.050 → 0.008 (3.8–4.6 s.e.) | 0.67–0.82 | 0.827–0.841 |
+| M4 | all | +0.003 → −0.005 (all < 2 s.e.) | 0.026 → 0.001 (3.0–4.6 s.e.) | 0.62–0.80 | **0.667 → 2.017** |
 
 As expected for window models (§5.2), the first three rows are the leak check. M2 is the first informative row.
+The M3 and M4 rows come from collapsed encoders (§6.4), and their normaliser (target variance on the memtest
+frames) is 0.0035–0.0042 against 0.090 for M2, so their normalised numbers are not comparable with M2's.
 Its errors are normalised by the target variance; the bracket is ± 1 s.e. over the 60 scenarios.
 
 | M2, gap (steps) | E1 memory effect | E2 surprise | voe_acc | reset effect |
@@ -302,8 +310,97 @@ What M2 shows:
 | M0 (1 token) | 0.026 | 0.0035 | 2.01 | 2.4 h |
 | M1 (16 tokens) | 0.029 | 0.0043 | 2.07 | 3.4 h |
 | M2 (belief) | 0.017 (8-step mean), 0.0059 (1-step) | 0.0072 | 1.99 | 3.0 h (+ 0.6 h eval) |
+| M3 (kin_v2, blind spans) | 0.020 / 0.012 | 0.0082 | 2.10 | 3.3 h |
+| M4 (map belief) | 0.021 / 0.013 | 0.0083 | 2.08 | 3.5 h |
 
-The prediction losses are not comparable across token counts: M1 also predicts 15 spatial tokens.
+The prediction losses are not comparable across token counts: M1 also predicts 15 spatial tokens. The SIGReg
+values are not comparable across batch sizes either (§6.4): M0/M1 estimate it from 128 samples, M2–M4 from 16.
+
+### 6.4 The frame encoder of M2–M4 collapsed
+
+Found on 2026-10-22, after M3 and M4 finished. The belief models' collapse monitors watched only the belief
+(rank 71–101, healthy), not the frame embedding the belief has to remember. Measured on the CLS token
+(`lewm/percept_diag.py`; 1600 frames of 60 kin_v1 validation episodes, 60 memtest scenarios):
+
+| | M0 | M1 | M2 | M3 | M4 |
+|---|---|---|---|---|---|
+| effective rank (RankMe) on kin_v1 frames | 74.7 | 68.2 | **8.6** | **6.4** | **6.6** |
+| variance share of the top direction | 0.04 | 0.04 | 0.30 | 0.32 | 0.31 |
+| wall signal: ‖z(W in view) − z(no W)‖², same frames otherwise | 1.49 | 1.44 | 0.63 | **0.010** | **0.011** |
+| SIGReg statistic at N = 16 samples (M2–M4 training) | 1.08 | 1.11 | 1.97 | 2.09 | 2.05 |
+| SIGReg statistic at N = 128 samples (M0/M1 training) | 1.92 | 2.00 | **9.9** | **11.4** | **11.2** |
+
+An i.i.d. N(0, I) sample scores 1.02–1.05 at every N.
+
+What this means:
+- **The encoder of every belief model lost most of its dimensions**: rank 66–73 → 6–9.
+- **In M3 and M4 the embedding barely registers the wall** (wall signal ~150× smaller than M0/M1). There is little
+  for the belief to remember, so E1 ≈ 0 or of the wrong sign, and low probe AP, follow regardless of the belief.
+- M2's geometry loss (visible AP 0.208 → 0.112, §6.1) has the same cause: the M2 encoder is already at rank 8.6.
+
+**Why SIGReg did not prevent it.** The Epps–Pulley statistic in SIGReg is
+EP = N ∫ |φ̂_N(t) − φ(t)|² w(t) dt, with φ̂_N the empirical characteristic function of N samples (LeJEPA §4.2.3;
+the factor N is in the official code, `module.SIGReg`). Under the null its expectation is a constant. A deviation Δ
+from N(0, I) costs ≈ N·Δ. The penalty on collapse therefore scales with N, at fixed λ.
+- LeWM and our M0/M1 estimate it per frame over the batch, N = 128.
+- `token_sigreg` in M2–M4 also takes N = B = 16, because the batch was cut from 128 windows of 4 frames to 16 of
+  32 to fit BPTT in memory. At the same λ = 0.09 the anti-collapse pressure is ≈ 8× weaker.
+- At N = 16 the collapsed encoders score 2.0–2.1 against M0's 1.08, so the logged SIGReg (≈ 2) looked normal. At
+  N = 128 they score 10–11 against M0's 1.92.
+
+Why the belief models collapse while M0/M1 do not, at the same encoder: the 8-step open-loop target is harder to
+predict than the next frame. JEPA objectives favour predictable, slow features (Littwin et al. 2024; Sobal et al.
+2022; H-JEPA App. L), and an 8× weaker regulariser lets the encoder drop what it cannot predict.
+
+Two other M3/M4 observations, to revisit only after the fix, because both rest on the collapsed encoder:
+- **M3's E1 is negative** at every gap: having seen W makes re-entry prediction worse, and zeroing the belief at
+  the turn-back lowers the error (reset effect −0.06 to −0.03).
+- **M4's error grows with the gap** (0.67 at 0 → 2.02 at 160 steps), and zeroing the map at the turn-back lowers it
+  by up to 1.31. The warped map accumulates error beyond the 8 s training window.
+
+### 6.5 The fix, its basis, and what it predicts (written before the M2s results)
+
+**What the literature says.**
+
+| source | relevant finding | consequence for us |
+|---|---|---|
+| LeJEPA (Balestriero & LeCun 2025, arXiv:2511.08544) §4.2.3, §5.1, Thm 6, Tab. 1c | EP statistic carries the factor N. Minibatch bias of loss and gradient is O(1/N), "not a concern even for minibatches as small as 16". Results are reported for batch 128–1024 (ViT-L: 72.2–74.7 %), and the recommended starting point is ≥ 128 | the bias argument does not cover effective strength; our N = 16 is outside every tested setting |
+| LeWM (Maes et al. 2026, arXiv:2603.19312) App. D, G, H | batch 128 × 4 frames; SIGReg per time step over the batch; λ ∈ [0.01, 0.2] all > 80 % success at batch 128, peak near 0.09; per-step SIGReg leaves the temporal structure unconstrained | our λ = 0.09 is tuned for N = 128 |
+| MotionJEPA (Karmann et al. 2026, arXiv:2609.23881) Tab. 1a | *LeWM-Flat*, SIGReg over the flattened batch × time samples, probes better than per-step LeWM in all three games (NMSE 0.284 / 0.331 / 0.694 vs 0.658 / 0.394 / 0.763). SIGReg along time only (*LeWM-Time*) is worse and "completely fails" on Golf | pooling frames into the sample is a tested, better-than-default placement; time-only is not |
+| RankMe (Garrido et al., ICML 2023, arXiv:2210.02885) | the effective rank of the embeddings, exp of the entropy of normalised singular values, is a label-free predictor of downstream quality in joint-embedding SSL | the percept monitor we lacked; the same formula as our `belief_rank` |
+| Jing et al., ICLR 2022 (arXiv:2110.09348) | joint-embedding methods can collapse dimensionally (low-rank spectrum) while not collapsing completely | what we see: SIGReg ≈ 2, no constant output, rank 7 |
+| Liu et al. 2026, TC-SIGReg (arXiv:2607.26924) | raw LeWM SIGReg "biases variance allocation toward the temporally persistent component"; SIGReg on temporally centred residuals fixes it for policy learning | a different failure (allocation, not rank). Not adopted now: a candidate if the fixed M2s keeps the rank but still drops the wall |
+
+**The change** (`loss.sigreg.samples=128`, `token_sigreg` in `lewm/train.py`). Per token position, pool the B × T
+frames of the batch and draw 128 of them for the statistic.
+- **Same estimator and strength as the runs that did not collapse.** N = 128 as in LeWM and M0/M1, with λ = 0.09
+  unchanged. Memory cost is unchanged from M1 (16 positions × 128 samples).
+- **The same target distribution.** Windows start at random offsets, so the marginal of a frame embedding does not
+  depend on its index in the window. Pooling frames estimates the same N(0, I) marginal from more samples. Frames
+  of one window are correlated, which raises the O(1/N) bias towards O(1/N_eff) with N_eff ≥ 16, the level LeJEPA
+  calls negligible.
+- **Rejected alternatives.**
+  - λ × 8 at N = 16: the same expected penalty, but from a 16-sample estimate, so a noisier gradient and a larger
+    bias.
+  - A larger batch: does not fit BPTT over 32 frames in 5.7 GB.
+  - SIGReg along time: worse in MotionJEPA.
+  - TC-SIGReg: targets a different failure (above).
+- **Monitor.** `train/percept_rank` (RankMe of the CLS over the batch frames) is now logged for every model.
+  `lewm/percept_diag.py` (rank, SIGReg at N = 16/128, wall signal) runs in `evaluate` after every model.
+
+**Pre-registered predictions for M2s** (M2 + the fix, otherwise identical: kin_v1, seed 3072, 15k steps):
+
+| quantity | M2 | prediction for M2s | if not |
+|---|---|---|---|
+| CLS rank on kin_v1 (percept_diag) | 8.6 | **≥ 50** (M0 75, M1 68) | the collapse has another cause (objective pressure); stop and rethink, do not run M3s/M4s |
+| SIGReg at N = 128 (percept_diag) | 9.9 | **≤ 3** (M0 1.92) | the fix did not reach the encoder |
+| visible AP, percept | 0.112 | ≥ 0.18 (M1 0.208) | rank is back but geometry is not: the 8-step target, not the regulariser, discards it (then TC-SIGReg / a 1-step percept loss) |
+| wall signal | 0.63 | ≥ 1.0 (M1 1.44) | as above |
+| E1 relative to re-entry error | 0.4 % | larger than M2 at gaps 20–80 | the belief, not the encoder, is the bottleneck for memory |
+
+**Gate.** M3s and M4s (M3 and M4 with the fix) run only if M2s meets the first two rows. The gate is the stage
+`gate_m2s` in `scripts/lewm_memory.sh`, and it fails the chain loudly otherwise. M3s and M4s are then judged against
+the M3 and M4 predictions of §7.
 
 ## 7. What would count as success, per milestone
 

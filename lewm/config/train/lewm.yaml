@@ -36,6 +36,7 @@ loss:
   sigreg:
     weight: 0.09
     positions: 16        # TokenJEPA / BeliefJEPA: token positions per step (random subset)
+    samples: null        # set (128): per token position, samples pooled over batch and time (M2s-M4s)
     kwargs:
       knots: 17
       num_proj: 1024

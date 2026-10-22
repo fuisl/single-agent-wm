@@ -2,6 +2,7 @@
 # LeWM memory line on the kinematic stand-in (docs/lewm_memory_review.md §5):
 #   parts_extract, parts_heads, parts: decoders + probes of the trained LeWM's encoder / predictor internals
 #   m0..m4: the R-LeWM ladder, each trained, probed and memory-tested on data/kin_v1
+#   m2s..m4s: M2-M4 with SIGReg on 128 pooled frames; gate_m2s (between m2s and m3s) stops the chain if M2s collapsed
 # Long runs: launch from a frozen copy (bash scripts/run_frozen.sh ...), never edit a script bash is executing.
 #   [SIM=kin] bash scripts/lewm_memory.sh [stage ...]
 # Each finished stage writes $R/.done_<stage> and is skipped on re-runs (delete the marker to redo it).
@@ -54,9 +55,10 @@ train() {  # train <name> <data dir> <hydra overrides...>
   (cd lewm && $PY_MAIN train.py data.dir=$data run_dir=$R/$name trainer.max_steps=$STEPS "$@")
 }
 
-evaluate() {  # evaluate <name> <context features>: probe data, memory test and probes, all on kin_v1 / memtest_v1
+evaluate() {  # evaluate <name> <context features>: probe data, memory test, percept collapse check and probes
   (cd lewm && $PY_MAIN extract_mem.py --run_dir $R/$1 --data $D --max_extract_train $NTRAIN \
-           && $PY_MAIN memtest.py --run_dir $R/$1 --data $WM_ROOT/data/memtest_v1)
+           && $PY_MAIN memtest.py --run_dir $R/$1 --data $WM_ROOT/data/memtest_v1 \
+           && $PY_MAIN percept_diag.py --run_dir $R/$1 --data $D --memtest $WM_ROOT/data/memtest_v1)
   probe_run $R/probe_$1 --no_frame --feats $1_percept=$R/$1/features_percept $1_$2=$R/$1/features_$2
 }
 
@@ -69,6 +71,18 @@ m3() { train m3 $WM_ROOT/data/${SIM}_v2 model=belief data.num_steps=32 loader.ba
 m4() { train m4 $WM_ROOT/data/${SIM}_v2 model=belief model.belief._target_=module.MapBelief data.num_steps=32 \
          loader.batch_size=16 blind.prob=0.5
        evaluate m4 belief; }                                                       # M3 with an ego-motion-warped map belief
+
+# M2-M4 with SIGReg on 128 frames pooled over batch and time (docs/single_agent_memory.md §6.4-6.5): at batch 16
+# the per-frame statistic sees N = 16 and the frame encoder collapsed (rank ~7)
+BELIEF="model=belief data.num_steps=32 loader.batch_size=16 loss.sigreg.samples=128"
+m2s() { train m2s $D $BELIEF; evaluate m2s belief; }
+gate_m2s() {  # pre-registered (§6.5): run M3s / M4s only if the fix restored the encoder
+  $PY_MAIN -c "import json, sys; d = json.load(open('$R/m2s/percept_diag.json')); print(d)
+sys.exit(0 if d['rank'] >= 50 and d['sigreg_128'] <= 3 else 'GATE_FAILED: M2s encoder still collapsed')"
+}
+m3s() { train m3s $WM_ROOT/data/${SIM}_v2 $BELIEF blind.prob=0.5; evaluate m3s belief; }
+m4s() { train m4s $WM_ROOT/data/${SIM}_v2 $BELIEF blind.prob=0.5 model.belief._target_=module.MapBelief
+        evaluate m4s belief; }
 
 viz() {  # pitch figures + episode videos (CPU, so it can run while the GPU trains); VIZ_SETS adds m* probe sets
   $PY_MAIN scripts/viz/latent_figures.py
