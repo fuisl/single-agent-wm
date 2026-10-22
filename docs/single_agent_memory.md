@@ -5,7 +5,8 @@ Status: 2026-10-22 15:00. M0–M4 and M2s done.
 - **M2s** (M2 with SIGReg on 128 pooled frames, §6.5) recovered most of the encoder and gives the **first clear memory
   result** (§6.6): E1 at 9–10 s.e. at every gap, 6–50× M2's relative size, decaying with time out of view, and
   belief memory AP above the frame-only control at every age.
-- It missed the pre-registered rank gate narrowly (47.4 vs 50), so the chain stopped before M3s / M4s.
+- It missed the pre-registered rank gate narrowly (47.4 vs 50). M3s / M4s are training anyway, as a declared
+  deviation (§6.6).
 - Weights: huggingface.co/fuisloy/r-lewm-uav (`m2s/`; M3 / M4 are not published).
 Companion documents:
 - `docs/lewm_memory_review.md`: the diagnosis, the literature review and the reasons for each design choice.
@@ -460,26 +461,37 @@ What M2s shows:
     (0.053 / 0.041 / 0.034) and above the curve the state alone gives: baseline `emb` and M2's belief score
     0.048–0.054 there.
   - So the state-prior caveat of §6.1 no longer explains the gain. A state-ablated probe would close it (§8).
-- **Open: resetting the belief helps.** Zeroing the belief at the start of the turn-back lowers the re-entry error by
-  ≈ 5 % at every gap. For M2 it raised the error by 5.7 %.
-  - The remembered wall itself is in the belief: the swap reproduces E1 exactly.
-  - So the rest of what the belief carries from the hover and look-away hurts prediction of the turn-back. The
-    turn-back is also where every model's error peaks (`mem_traces.png`).
-  - Two candidate explanations:
-    - every training window starts from a zero belief, so a fresh start is the best-practised state of the
-      open-loop head;
-    - a 3 s hover followed by a 110–150° yaw is rare in kin_v1, so the motion context the belief carries mis-predicts
-      the turn.
-  - Check: reset at random points of held-out kin_v1 episodes. If the reset also helps there, the belief carries
-    harmful context in general.
-  - This does not affect E1 or E2, because the twins share everything but W.
+- **Resetting the belief helps at the turn-back.** Zeroing the belief at the start of the turn-back lowers the
+  re-entry error by ≈ 5 % at every gap. For M2 it raised the error by 5.7 %.
+  - The remembered wall itself is in the belief: the swap reproduces E1 exactly. This does not affect E1 or E2,
+    because the twins share everything but W.
+  - The check on ordinary flight (`lewm/reset_check.py`): the belief is reset at 300 points of 60 held-out kin_v1
+    episodes, and its one-step error is compared with the intact belief's.
+
+    | | intact error | 1st frame after reset | frames 2–6 | mean over 16 frames |
+    |---|---|---|---|---|
+    | M2 | 0.0069 | +0.019 | ≈ 0 | **+19 %** |
+    | M2s | 0.046 | +0.010 | −0.0006 to −0.0011 (2–3 s.e. each, ≈ −2 %) | **+0.7 % ± 0.2** |
+
+    An intact belief from the episode start and one from 16 frames before the reset (the training regime) give the
+    same numbers.
+  - Readings:
+    - M2s's one-step prediction on ordinary flight uses only ≈ 1 frame of history. This is §5.1 seen from the model
+      side: kin_v1 hardly rewards memory.
+    - A fresh belief has a small advantage over the next ≈ 1 s in general. The turn-back amplifies it from ≈ 2 % to
+      ≈ 5 %.
+    - It is not a length-generalisation failure.
+  - Candidate cause: every training window starts from a zero belief, so the model is best practised just after a
+    fresh start. Carrying the belief across windows in training (§8) would remove that asymmetry.
 
 **The gate.** By the pre-registered rule, M2s failed the gate (rank 47.4 < 50), and the chain stopped before M3s.
 The rule's stated reading of a failure ("the collapse has another cause") does not fit: the change raised the rank
-5.5×, and every other prediction about the encoder was met except visible AP. Running M3s / M4s on this encoder
-would be a declared deviation from the gate. **Decision pending**, with two options:
-- (a) run M3s / M4s now;
-- (b) first close the remaining rank gap, then run them.
+5.5×, and every other prediction about the encoder was met except visible AP.
+
+**Declared deviation (2026-10-22 15:08).** M3s and M4s run on this encoder anyway (log `logs/lewm_sigfix_m3s.log`).
+Their results carry this caveat: the encoder's rank is 47, not ≥ 50. They are judged against the §7 M3 / M4
+predictions, with M2s as the comparison row. The state-only probe control (`state_probe`) runs after them, on the
+GPU.
 
 ## 7. What would count as success, per milestone
 
@@ -499,10 +511,12 @@ data; matching its 0.105 is not required for the claim.
 
 ## 8. Open issues and next steps
 
-- **M3s / M4s.** Pending the gate decision (§6.6).
-- **State-ablated probe.** Probe M2s's belief with the state input zeroed or shuffled, to confirm that the memory
-  AP gain is not the state.
-- **Reset helps M2s (§6.6).** Reset the belief at random points of held-out kin_v1 episodes.
+- **M3s / M4s.** Training (declared deviation from the gate, §6.6).
+- **State-only probe control.** Queued after M4s (`state_probe`). It probes the belief's non-image inputs: the
+  state and action history over the 8 s training window (`lewm/extract_state.py`). It runs in the same probe run as
+  M2s's belief, so the two are directly comparable.
+- **Belief carried across windows.** Training always starts the belief from zeros, which favours a fresh start
+  (§6.6 reset check). Truncated BPTT with the belief carried over would remove that, and test longer memory.
 
 - **Seeds.** Every number is a single seed. Rerun the deciding rungs (M2 vs M3, and M4 if it differs) with 3 seeds
   before claiming anything.

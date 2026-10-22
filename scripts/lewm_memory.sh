@@ -3,6 +3,7 @@
 #   parts_extract, parts_heads, parts: decoders + probes of the trained LeWM's encoder / predictor internals
 #   m0..m4: the R-LeWM ladder, each trained, probed and memory-tested on data/kin_v1
 #   m2s..m4s: M2-M4 with SIGReg on 128 pooled frames; gate_m2s (between m2s and m3s) stops the chain if M2s collapsed
+#   state_probe: M2s belief vs a probe on its state + action inputs alone
 # Long runs: launch from a frozen copy (bash scripts/run_frozen.sh ...), never edit a script bash is executing.
 #   [SIM=kin] bash scripts/lewm_memory.sh [stage ...]
 # Each finished stage writes $R/.done_<stage> and is skipped on re-runs (delete the marker to redo it).
@@ -83,6 +84,10 @@ sys.exit(0 if d['rank'] >= 50 and d['sigreg_128'] <= 3 else 'GATE_FAILED: M2s en
 m3s() { train m3s $WM_ROOT/data/${SIM}_v2 $BELIEF blind.prob=0.5; evaluate m3s belief; }
 m4s() { train m4s $WM_ROOT/data/${SIM}_v2 $BELIEF blind.prob=0.5 model.belief._target_=module.MapBelief
         evaluate m4s belief; }
+state_probe() {  # control (§6.6): probe the belief's non-image inputs (state + action history, 8 s) next to M2s's belief
+  (cd lewm && $PY_MAIN extract_state.py --run_dir $R/m2s --data $D)
+  probe_run $R/probe_state --no_frame --feats m2s_belief=$R/m2s/features_belief state_hist=$R/m2s/features_state
+}
 
 viz() {  # pitch figures + episode videos (CPU, so it can run while the GPU trains); VIZ_SETS adds m* probe sets
   $PY_MAIN scripts/viz/latent_figures.py
